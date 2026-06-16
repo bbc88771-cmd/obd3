@@ -1806,6 +1806,114 @@ class AppColors {
   }
 }
 
+/// Простейшая локализация: словарь ключ → перевод для RU/EN.
+/// Глобальный `lang` выставляется в ObdApp из langProvider, чтобы строки можно
+/// было получать и вне виджетов. Незнакомый ключ возвращается как есть.
+class L {
+  static String lang = "ru";
+  static String t(String key) => (lang == "en" ? _en : _ru)[key] ?? key;
+
+  static const _ru = <String, String>{
+    "garage": "Гараж",
+    "sensors": "Датчики",
+    "diagnostics": "Диагностика",
+    "more": "Ещё",
+    "gauges": "Показатели",
+    "ecuMonitor": "Мониторинг ЭБУ",
+    "freezeFrame": "Стоп-кадр",
+    "ecuId": "Идентификаторы ЭБУ",
+    "emissions": "Тесты на выбросы",
+    "stats": "Статистика",
+    "dataLog": "Запись данных",
+    "accel": "Замер разгона",
+    "myCars": "Мои автомобили",
+    "settings": "Настройки",
+    "dtc": "Ошибки (DTC)",
+    "history": "Журнал проверок",
+    "connected": "Связь с автомобилем",
+    "demoActive": "Демо-режим активен",
+    "connecting": "Устанавливаем связь…",
+    "readyToConnect": "Готов к подключению",
+    "connect": "Подключить",
+    "disconnect": "Отключить",
+    "demo": "Демо",
+    "connectShort": "Подключение…",
+    "notConnTitle": "Адаптер не подключён",
+    "notConnHint": "Откройте вкладку «Гараж» и нажмите\n«Подключить» или «Демо-режим».",
+    "keyMetrics": "Ключевые показатели",
+    "speed": "Скорость",
+    "rpm": "Обороты",
+    "coolant": "Темп. ОЖ",
+    "voltage": "Напряжение",
+    "appearance": "Внешний вид",
+    "darkTheme": "Тёмная тема",
+    "accent": "Акцент",
+    "language": "Язык",
+    "adapterType": "Тип адаптера",
+    "pollRate": "Частота опроса",
+    "scanErrors": "Сканировать ошибки",
+    "rescan": "Пересканировать",
+    "reset": "Сброс",
+    "allBlocks": "По всем блокам",
+    "stored": "Сохранённые",
+    "pending": "Ожидающие",
+    "permanent": "Постоянные",
+    "noErrors": "Ошибок не найдено",
+    "tools": "Инструменты",
+    "gaugesHint": "Круговые приборы",
+  };
+
+  static const _en = <String, String>{
+    "garage": "Garage",
+    "sensors": "Sensors",
+    "diagnostics": "Diagnostics",
+    "more": "More",
+    "gauges": "Gauges",
+    "ecuMonitor": "ECU monitor",
+    "freezeFrame": "Freeze frame",
+    "ecuId": "ECU identifiers",
+    "emissions": "Emission tests",
+    "stats": "Statistics",
+    "dataLog": "Data logging",
+    "accel": "Acceleration",
+    "myCars": "My cars",
+    "settings": "Settings",
+    "dtc": "Trouble codes (DTC)",
+    "history": "Scan history",
+    "connected": "Car connected",
+    "demoActive": "Demo mode active",
+    "connecting": "Connecting…",
+    "readyToConnect": "Ready to connect",
+    "connect": "Connect",
+    "disconnect": "Disconnect",
+    "demo": "Demo",
+    "connectShort": "Connecting…",
+    "notConnTitle": "Adapter not connected",
+    "notConnHint": "Open the “Garage” tab and tap\n“Connect” or “Demo mode”.",
+    "keyMetrics": "Key metrics",
+    "speed": "Speed",
+    "rpm": "RPM",
+    "coolant": "Coolant",
+    "voltage": "Voltage",
+    "appearance": "Appearance",
+    "darkTheme": "Dark theme",
+    "accent": "Accent",
+    "language": "Language",
+    "adapterType": "Adapter type",
+    "pollRate": "Poll rate",
+    "scanErrors": "Scan for codes",
+    "rescan": "Rescan",
+    "reset": "Clear",
+    "allBlocks": "All modules",
+    "stored": "Stored",
+    "pending": "Pending",
+    "permanent": "Permanent",
+    "noErrors": "No codes found",
+    "tools": "Tools",
+    "gaugesHint": "Dial gauges",
+  };
+}
+
 /// Скруглённый прогресс-прибор в новом стиле: толстая дуга со скруглением,
 /// крупное число в центре, акцентный «бегунок» вместо классической стрелки.
 class GaugeWidget extends StatelessWidget {
@@ -1989,13 +2097,13 @@ class _NotConnected extends StatelessWidget {
                 color: AppColors.textDim, size: 44),
           ),
           const SizedBox(height: 16),
-          Text("Адаптер не подключён",
+          Text(L.t("notConnTitle"),
               style: TextStyle(
                   color: AppColors.text,
                   fontSize: 17,
                   fontWeight: FontWeight.w600)),
           const SizedBox(height: 6),
-          Text(hint ?? "Откройте вкладку «Гараж» и нажмите\n«Подключить» или «Демо-режим».",
+          Text(hint ?? L.t("notConnHint"),
               textAlign: TextAlign.center,
               style: TextStyle(color: AppColors.textDim, fontSize: 13)),
         ],
@@ -2037,10 +2145,10 @@ class ConnectCard extends ConsumerWidget {
             Expanded(
               child: Text(
                 conn.isBusy
-                    ? "Устанавливаем связь…"
+                    ? L.t("connecting")
                     : conn.isConnected
-                        ? (conn.demo ? "Демо-режим активен" : "Связь с автомобилем")
-                        : "Готов к подключению",
+                        ? (conn.demo ? L.t("demoActive") : L.t("connected"))
+                        : L.t("readyToConnect"),
                 style: TextStyle(
                     color: AppColors.text, fontSize: 17, fontWeight: FontWeight.w700),
               ),
@@ -2087,10 +2195,10 @@ class ConnectCard extends ConsumerWidget {
                         }
                       },
                 child: Text(conn.isBusy
-                    ? "Подключение…"
+                    ? L.t("connectShort")
                     : conn.isConnected
-                        ? "Отключить"
-                        : "Подключить"),
+                        ? L.t("disconnect")
+                        : L.t("connect")),
               ),
             ),
             const SizedBox(width: 10),
@@ -2109,7 +2217,7 @@ class ConnectCard extends ConsumerWidget {
                           interval: Duration(
                               milliseconds: ref.read(pollIntervalMsProvider)),
                         ),
-                child: const Text("Демо"),
+                child: Text(L.t("demo")),
               ),
             ),
           ]),
@@ -2286,7 +2394,7 @@ class _DashboardTab extends ConsumerWidget {
         const ConnectCard(),
         const SizedBox(height: 16),
         if (conn.isConnected) ...[
-          const SectionTitle("Ключевые показатели"),
+          SectionTitle(L.t("keyMetrics")),
           GridView.count(
             crossAxisCount: 2,
             shrinkWrap: true,
@@ -2295,18 +2403,18 @@ class _DashboardTab extends ConsumerWidget {
             crossAxisSpacing: 12,
             childAspectRatio: 1.45,
             children: [
-              MetricCard(label: "Скорость", value: "${t.speed ?? 0}", unit: "км/ч",
+              MetricCard(label: L.t("speed"), value: "${t.speed ?? 0}", unit: "км/ч",
                   fraction: (t.speed ?? 0) / 240, color: AppColors.accent2, icon: Icons.speed),
-              MetricCard(label: "Обороты", value: "${t.rpm ?? 0}", unit: "об/мин",
+              MetricCard(label: L.t("rpm"), value: "${t.rpm ?? 0}", unit: "об/мин",
                   fraction: (t.rpm ?? 0) / 8000, color: AppColors.accent, icon: Icons.autorenew),
-              MetricCard(label: "Темп. ОЖ", value: "${t.coolant ?? 0}", unit: "°C",
+              MetricCard(label: L.t("coolant"), value: "${t.coolant ?? 0}", unit: "°C",
                   fraction: (t.coolant ?? 0) / 130, color: AppColors.warn, icon: Icons.thermostat),
-              MetricCard(label: "Напряжение", value: (t.voltage ?? 0).toStringAsFixed(1), unit: "В",
+              MetricCard(label: L.t("voltage"), value: (t.voltage ?? 0).toStringAsFixed(1), unit: "В",
                   fraction: (t.voltage ?? 0) / 15, color: AppColors.ok, icon: Icons.battery_charging_full),
             ],
           ),
           const SizedBox(height: 8),
-          const SectionTitle("Диагностика"),
+          SectionTitle(L.t("diagnostics")),
           const _DtcPanel(),
         ] else
           Padding(
@@ -2594,11 +2702,10 @@ class RootShell extends ConsumerStatefulWidget {
 class _RootShellState extends ConsumerState<RootShell> {
   int _index = 0;
 
-  static const _titles = ["Гараж", "Датчики", "Диагностика", "Ещё"];
-
   @override
   Widget build(BuildContext context) {
     final conn = ref.watch(connectionProvider);
+    final titles = [L.t("garage"), L.t("sensors"), L.t("diagnostics"), L.t("more")];
 
     return Scaffold(
       backgroundColor: AppColors.bg,
@@ -2607,7 +2714,7 @@ class _RootShellState extends ConsumerState<RootShell> {
         elevation: 0,
         titleSpacing: 20,
         title: Row(children: [
-          Text(_index == 0 ? "Revoscan" : _titles[_index],
+          Text(_index == 0 ? "Revoscan" : titles[_index],
               style: const TextStyle(
                   fontWeight: FontWeight.w800, fontSize: 20, letterSpacing: -0.5)),
         ]),
@@ -2629,21 +2736,21 @@ class _RootShellState extends ConsumerState<RootShell> {
         indicatorColor: AppColors.accent.withOpacity(0.22),
         destinations: [
           NavigationDestination(
-              icon: Icon(Icons.garage_outlined),
+              icon: const Icon(Icons.garage_outlined),
               selectedIcon: Icon(Icons.garage, color: AppColors.accent),
-              label: "Гараж"),
+              label: L.t("garage")),
           NavigationDestination(
-              icon: Icon(Icons.sensors_outlined),
+              icon: const Icon(Icons.sensors_outlined),
               selectedIcon: Icon(Icons.sensors, color: AppColors.accent),
-              label: "Датчики"),
+              label: L.t("sensors")),
           NavigationDestination(
-              icon: Icon(Icons.troubleshoot_outlined),
+              icon: const Icon(Icons.troubleshoot_outlined),
               selectedIcon: Icon(Icons.troubleshoot, color: AppColors.accent),
-              label: "Диагностика"),
+              label: L.t("diagnostics")),
           NavigationDestination(
-              icon: Icon(Icons.apps_outlined),
+              icon: const Icon(Icons.apps_outlined),
               selectedIcon: Icon(Icons.apps, color: AppColors.accent),
-              label: "Ещё"),
+              label: L.t("more")),
         ],
       ),
     );
@@ -4265,12 +4372,26 @@ class SettingsScreen extends ConsumerWidget {
       backgroundColor: AppColors.bg,
       appBar: AppBar(
         backgroundColor: AppColors.surface,
-        title: const Text("Настройки"),
+        title: Text(L.t("settings")),
       ),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          Text("Внешний вид",
+          Text(L.t("language"), style: TextStyle(color: AppColors.textDim, fontSize: 13)),
+          const SizedBox(height: 8),
+          SegmentedButton<String>(
+            segments: const [
+              ButtonSegment(value: "ru", label: Text("Русский")),
+              ButtonSegment(value: "en", label: Text("English")),
+            ],
+            selected: {ref.watch(langProvider)},
+            onSelectionChanged: (s) {
+              ref.read(langProvider.notifier).state = s.first;
+              ref.read(prefsProvider).setString("lang", s.first);
+            },
+          ),
+          const SizedBox(height: 24),
+          Text(L.t("appearance"),
               style: TextStyle(color: AppColors.textDim, fontSize: 13)),
           const SizedBox(height: 8),
           Container(
@@ -4278,7 +4399,7 @@ class SettingsScreen extends ConsumerWidget {
             child: SwitchListTile(
               value: ref.watch(isDarkThemeProvider),
               activeColor: AppColors.accent,
-              title: Text("Тёмная тема", style: TextStyle(color: AppColors.text)),
+              title: Text(L.t("darkTheme"), style: TextStyle(color: AppColors.text)),
               subtitle: Text(
                   ref.watch(isDarkThemeProvider) ? "Графит" : "Светлый фон",
                   style: TextStyle(color: AppColors.textDim, fontSize: 12)),
@@ -4289,7 +4410,7 @@ class SettingsScreen extends ConsumerWidget {
             ),
           ),
           const SizedBox(height: 12),
-          Text("Акцент", style: TextStyle(color: AppColors.textDim, fontSize: 13)),
+          Text(L.t("accent"), style: TextStyle(color: AppColors.textDim, fontSize: 13)),
           const SizedBox(height: 8),
           Row(
             children: AppColors.accents.entries.map((e) {
@@ -4320,7 +4441,7 @@ class SettingsScreen extends ConsumerWidget {
             }).toList(),
           ),
           const SizedBox(height: 24),
-          Text("Тип адаптера",
+          Text(L.t("adapterType"),
               style: TextStyle(color: AppColors.textDim, fontSize: 13)),
           const SizedBox(height: 8),
           SegmentedButton<TransportKind>(
@@ -4409,8 +4530,10 @@ class ObdApp extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final dark = ref.watch(isDarkThemeProvider);
     final accentKey = ref.watch(accentKeyProvider);
-    // Применяем выбранную палитру до построения дерева.
+    final lang = ref.watch(langProvider);
+    // Применяем выбранную палитру и язык до построения дерева.
     AppColors.apply(dark: dark, accentKey: accentKey);
+    L.lang = lang;
 
     final scheme = ColorScheme.fromSeed(
       seedColor: AppColors.accent,
@@ -4420,8 +4543,8 @@ class ObdApp extends ConsumerWidget {
       secondary: AppColors.accent2,
     );
     return MaterialApp(
-      // Ключ зависит от темы — при смене всё дерево пересобирается с новой палитрой.
-      key: ValueKey("$dark-$accentKey"),
+      // Ключ зависит от темы и языка — при смене всё дерево пересобирается.
+      key: ValueKey("$dark-$accentKey-$lang"),
       title: "Revoscan",
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
