@@ -3260,16 +3260,22 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
                     const SectionTitle("По блокам"),
                     ..._modules.map(_moduleCard),
                   ],
-                  if (total == 0 && _modules.isEmpty && !_loading)
+                  if (total == 0 && _modules.isEmpty && !_loading) ...[
                     Padding(
                       padding: const EdgeInsets.only(top: 24),
                       child: Column(children: [
                         Icon(Icons.verified, color: AppColors.ok, size: 48),
                         const SizedBox(height: 10),
-                        Text("Ошибок не найдено",
+                        Text("Ошибок двигателя не найдено",
                             style: TextStyle(color: AppColors.text, fontSize: 16)),
+                        const SizedBox(height: 4),
+                        Text("Проверено по OBD (двигатель и выхлоп)",
+                            style: TextStyle(color: AppColors.textDim, fontSize: 12)),
                       ]),
                     ),
+                    const SizedBox(height: 16),
+                    _obdLimitNote(),
+                  ],
                 ],
               ],
             ),
@@ -3366,6 +3372,45 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
           ),
         ),
       ]),
+    );
+  }
+
+  /// Честная плашка о границах OBD: кузовные/комфортные блоки по OBD недоступны.
+  Widget _obdLimitNote() {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: AppColors.warn.withOpacity(0.10),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: AppColors.warn.withOpacity(0.35)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.info_outline, color: AppColors.warn, size: 20),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text("Не все ошибки видны по OBD",
+                    style: TextStyle(
+                        color: AppColors.text,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600)),
+                const SizedBox(height: 4),
+                Text(
+                    "OBD-II читает только двигатель и выхлоп. Неисправности света, "
+                    "капота, омывателя, ABS, подушек хранятся в кузовных блоках и "
+                    "доступны лишь по протоколу производителя (для Audi — VCDS/OBDeleven "
+                    "со своим адаптером). Через обычный ELM327 их прочитать нельзя.",
+                    style: TextStyle(
+                        color: AppColors.textDim, fontSize: 12.5, height: 1.35)),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 
