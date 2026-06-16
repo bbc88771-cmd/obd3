@@ -1620,6 +1620,16 @@ final wifiPortProvider = StateProvider<int>(
 final pollIntervalMsProvider = StateProvider<int>(
     (ref) => ref.watch(prefsProvider).getInt("pollIntervalMs") ?? 500);
 
+/// Тема: тёмная/светлая и акцентный цвет (сохраняются в настройках).
+final isDarkThemeProvider = StateProvider<bool>(
+    (ref) => ref.watch(prefsProvider).getBool("darkTheme") ?? true);
+final accentKeyProvider = StateProvider<String>(
+    (ref) => ref.watch(prefsProvider).getString("accentKey") ?? "orange");
+
+/// Язык интерфейса ("ru"/"en").
+final langProvider = StateProvider<String>(
+    (ref) => ref.watch(prefsProvider).getString("lang") ?? "ru");
+
 /// Фабрика транспорта по выбранному типу.
 ObdTransport _buildTransport(TransportKind kind, {String? host, int? port}) {
   switch (kind) {
@@ -1755,17 +1765,45 @@ final telemetryProvider = StreamProvider<Telemetry>((ref) {
 
 /// Единая палитра. Намеренно уходим от «синего» стиля типовых OBD-приложений:
 /// тёмный графит + энергичный оранжевый акцент и бирюзовый второстепенный.
+/// Динамическая палитра: значения меняются при выборе темы в настройках
+/// (AppColors.apply). Виджеты читают эти поля при сборке, а смена темы
+/// перестраивает всё приложение (ключ у MaterialApp).
 class AppColors {
-  static const bg = Color(0xFF0C100F);
-  static const surface = Color(0xFF171D1C);
-  static const surface2 = Color(0xFF212927);
-  static const accent = Color(0xFFFF6A2C); // оранжевый
-  static const accent2 = Color(0xFF2DD4BF); // бирюзовый
-  static const ok = Color(0xFF34D399);
-  static const warn = Color(0xFFF5A524);
-  static const err = Color(0xFFFF5A5F);
-  static const text = Color(0xFFF2F4F3);
-  static const textDim = Color(0xFF8A938F);
+  static Color bg = const Color(0xFF0C100F);
+  static Color surface = const Color(0xFF171D1C);
+  static Color surface2 = const Color(0xFF212927);
+  static Color accent = const Color(0xFFFF6A2C); // оранжевый
+  static Color accent2 = const Color(0xFF2DD4BF); // бирюзовый
+  static Color ok = const Color(0xFF34D399);
+  static Color warn = const Color(0xFFF5A524);
+  static Color err = const Color(0xFFFF5A5F);
+  static Color text = const Color(0xFFF2F4F3);
+  static Color textDim = const Color(0xFF8A938F);
+
+  /// Доступные акценты (ключ → цвет).
+  static const accents = <String, Color>{
+    "orange": Color(0xFFFF6A2C),
+    "teal": Color(0xFF2DD4BF),
+    "lime": Color(0xFFB6F23C),
+    "violet": Color(0xFF9B7BFF),
+  };
+
+  static void apply({required bool dark, required String accentKey}) {
+    accent = accents[accentKey] ?? const Color(0xFFFF6A2C);
+    if (dark) {
+      bg = const Color(0xFF0C100F);
+      surface = const Color(0xFF171D1C);
+      surface2 = const Color(0xFF212927);
+      text = const Color(0xFFF2F4F3);
+      textDim = const Color(0xFF8A938F);
+    } else {
+      bg = const Color(0xFFEFF2F1);
+      surface = const Color(0xFFFFFFFF);
+      surface2 = const Color(0xFFE4E9E7);
+      text = const Color(0xFF15201D);
+      textDim = const Color(0xFF6A736F);
+    }
+  }
 }
 
 /// Скруглённый прогресс-прибор в новом стиле: толстая дуга со скруглением,
@@ -1783,7 +1821,7 @@ class GaugeWidget extends StatelessWidget {
     required this.unit,
     required this.value,
     required this.maxValue,
-    this.color = AppColors.accent,
+    this.color = const Color(0xFFFF6A2C),
   });
 
   @override
@@ -1798,13 +1836,13 @@ class GaugeWidget extends StatelessWidget {
             children: [
               const SizedBox(height: 30),
               Text(value.toStringAsFixed(0),
-                  style: const TextStyle(
+                  style: TextStyle(
                       color: AppColors.text,
                       fontSize: 32,
                       fontWeight: FontWeight.w800,
                       letterSpacing: -1)),
               Text(unit,
-                  style: const TextStyle(color: AppColors.textDim, fontSize: 12)),
+                  style: TextStyle(color: AppColors.textDim, fontSize: 12)),
               const SizedBox(height: 2),
               Text(label.toUpperCase(),
                   style: TextStyle(
@@ -1889,7 +1927,7 @@ class SectionTitle extends StatelessWidget {
               color: AppColors.accent, borderRadius: BorderRadius.circular(2))),
           const SizedBox(width: 8),
           Text(text.toUpperCase(),
-              style: const TextStyle(
+              style: TextStyle(
                   color: AppColors.textDim,
                   fontSize: 12,
                   letterSpacing: 1.5,
@@ -1947,11 +1985,11 @@ class _NotConnected extends StatelessWidget {
             padding: const EdgeInsets.all(22),
             decoration: BoxDecoration(
                 color: AppColors.surface, shape: BoxShape.circle),
-            child: const Icon(Icons.power_off_rounded,
+            child: Icon(Icons.power_off_rounded,
                 color: AppColors.textDim, size: 44),
           ),
           const SizedBox(height: 16),
-          const Text("Адаптер не подключён",
+          Text("Адаптер не подключён",
               style: TextStyle(
                   color: AppColors.text,
                   fontSize: 17,
@@ -1959,7 +1997,7 @@ class _NotConnected extends StatelessWidget {
           const SizedBox(height: 6),
           Text(hint ?? "Откройте вкладку «Гараж» и нажмите\n«Подключить» или «Демо-режим».",
               textAlign: TextAlign.center,
-              style: const TextStyle(color: AppColors.textDim, fontSize: 13)),
+              style: TextStyle(color: AppColors.textDim, fontSize: 13)),
         ],
       ),
     );
@@ -2003,7 +2041,7 @@ class ConnectCard extends ConsumerWidget {
                     : conn.isConnected
                         ? (conn.demo ? "Демо-режим активен" : "Связь с автомобилем")
                         : "Готов к подключению",
-                style: const TextStyle(
+                style: TextStyle(
                     color: AppColors.text, fontSize: 17, fontWeight: FontWeight.w700),
               ),
             ),
@@ -2017,7 +2055,7 @@ class ConnectCard extends ConsumerWidget {
           if (conn.error != null) ...[
             const SizedBox(height: 10),
             Text(conn.error!,
-                style: const TextStyle(color: AppColors.err, fontSize: 12)),
+                style: TextStyle(color: AppColors.err, fontSize: 12)),
           ],
           const SizedBox(height: 16),
           Row(children: [
@@ -2060,7 +2098,7 @@ class ConnectCard extends ConsumerWidget {
               child: OutlinedButton(
                 style: OutlinedButton.styleFrom(
                   foregroundColor: AppColors.accent2,
-                  side: const BorderSide(color: AppColors.accent2),
+                  side: BorderSide(color: AppColors.accent2),
                   padding: const EdgeInsets.symmetric(vertical: 14),
                   shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(14)),
@@ -2136,7 +2174,7 @@ class MetricCard extends StatelessWidget {
               child: Text(label.toUpperCase(),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
+                  style: TextStyle(
                       color: AppColors.textDim,
                       fontSize: 10.5,
                       letterSpacing: 1,
@@ -2147,13 +2185,13 @@ class MetricCard extends StatelessWidget {
           Row(crossAxisAlignment: CrossAxisAlignment.baseline,
               textBaseline: TextBaseline.alphabetic, children: [
             Text(value,
-                style: const TextStyle(
+                style: TextStyle(
                     color: AppColors.text,
                     fontSize: 26,
                     fontWeight: FontWeight.w800,
                     letterSpacing: -0.5)),
             const SizedBox(width: 4),
-            Text(unit, style: const TextStyle(color: AppColors.textDim, fontSize: 12)),
+            Text(unit, style: TextStyle(color: AppColors.textDim, fontSize: 12)),
           ]),
           const SizedBox(height: 10),
           ClipRRect(
@@ -2212,15 +2250,15 @@ class HubTile extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(title, style: const TextStyle(
+                    Text(title, style: TextStyle(
                         color: AppColors.text, fontSize: 15, fontWeight: FontWeight.w600)),
                     const SizedBox(height: 2),
-                    Text(subtitle, style: const TextStyle(
+                    Text(subtitle, style: TextStyle(
                         color: AppColors.textDim, fontSize: 12)),
                   ],
                 ),
               ),
-              const Icon(Icons.chevron_right, color: AppColors.textDim),
+              Icon(Icons.chevron_right, color: AppColors.textDim),
             ]),
           ),
         ),
@@ -2289,9 +2327,9 @@ class GaugesScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final conn = ref.watch(connectionProvider);
     return Scaffold(
-      backgroundColor: const Color(0xFF0C100F),
+      backgroundColor: AppColors.bg,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF171D1C),
+        backgroundColor: AppColors.surface,
         title: const Text("Показатели"),
         actions: [_StatusChip(conn.link)],
       ),
@@ -2397,10 +2435,10 @@ class _DtcPanel extends StatelessWidget {
               decoration: BoxDecoration(
                   color: AppColors.err.withOpacity(0.15),
                   borderRadius: BorderRadius.circular(12)),
-              child: const Icon(Icons.error_outline, color: AppColors.err, size: 22),
+              child: Icon(Icons.error_outline, color: AppColors.err, size: 22),
             ),
             const SizedBox(width: 14),
-            const Expanded(
+            Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -2415,7 +2453,7 @@ class _DtcPanel extends StatelessWidget {
                 ],
               ),
             ),
-            const Icon(Icons.chevron_right, color: AppColors.textDim),
+            Icon(Icons.chevron_right, color: AppColors.textDim),
           ]),
         ),
       ),
@@ -2589,7 +2627,7 @@ class _RootShellState extends ConsumerState<RootShell> {
         onDestinationSelected: (i) => setState(() => _index = i),
         backgroundColor: AppColors.surface,
         indicatorColor: AppColors.accent.withOpacity(0.22),
-        destinations: const [
+        destinations: [
           NavigationDestination(
               icon: Icon(Icons.garage_outlined),
               selectedIcon: Icon(Icons.garage, color: AppColors.accent),
@@ -2636,14 +2674,14 @@ class _SensorsTab extends ConsumerWidget {
           child: Row(children: [
             Expanded(
                 child: Text(label,
-                    style: const TextStyle(color: AppColors.text, fontSize: 14))),
+                    style: TextStyle(color: AppColors.text, fontSize: 14))),
             Text(value,
-                style: const TextStyle(
+                style: TextStyle(
                     color: AppColors.accent,
                     fontSize: 18,
                     fontWeight: FontWeight.w700)),
             const SizedBox(width: 4),
-            Text(unit, style: const TextStyle(color: AppColors.textDim, fontSize: 12)),
+            Text(unit, style: TextStyle(color: AppColors.textDim, fontSize: 12)),
           ]),
         );
       },
@@ -2767,9 +2805,9 @@ class SensorListScreen extends ConsumerWidget {
     final tele = ref.watch(telemetryProvider);
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0C100F),
+      backgroundColor: AppColors.bg,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF171D1C),
+        backgroundColor: AppColors.surface,
         title: Text(title),
         actions: [_StatusChip(conn.link)],
       ),
@@ -2922,8 +2960,8 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
       context: context,
       builder: (_) => AlertDialog(
         backgroundColor: AppColors.surface,
-        title: const Text("Сбросить ошибки?", style: TextStyle(color: AppColors.text)),
-        content: const Text(
+        title: Text("Сбросить ошибки?", style: TextStyle(color: AppColors.text)),
+        content: Text(
             "Check Engine погаснет, стоп-кадр будет стёрт, а мониторы выбросов "
             "сбросятся в «не готов». Постоянные коды (Mode 0A) так не стираются. "
             "Автомобиль должен стоять (V=0). Продолжить?",
@@ -2984,11 +3022,11 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
           children: [
             Row(children: [
               Text(info.code,
-                  style: const TextStyle(
+                  style: TextStyle(
                       color: AppColors.text, fontSize: 26, fontWeight: FontWeight.w800)),
               const Spacer(),
               IconButton(
-                icon: const Icon(Icons.copy, color: AppColors.textDim, size: 20),
+                icon: Icon(Icons.copy, color: AppColors.textDim, size: 20),
                 onPressed: () {
                   Clipboard.setData(ClipboardData(text: info.code));
                   ScaffoldMessenger.of(context).showSnackBar(
@@ -3004,12 +3042,12 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
             ]),
             const SizedBox(height: 16),
             Text(info.description,
-                style: const TextStyle(color: AppColors.text, fontSize: 15, height: 1.4)),
+                style: TextStyle(color: AppColors.text, fontSize: 15, height: 1.4)),
             const SizedBox(height: 18),
             SizedBox(
               width: double.infinity,
               child: OutlinedButton.icon(
-                icon: const Icon(Icons.search),
+                icon: Icon(Icons.search),
                 label: const Text("Скопировать код для поиска"),
                 style: OutlinedButton.styleFrom(foregroundColor: AppColors.accent),
                 onPressed: () {
@@ -3039,19 +3077,19 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
     final conn = ref.watch(connectionProvider);
     final total = _stored.length + _pending.length + _permanent.length;
     return Scaffold(
-      backgroundColor: const Color(0xFF0C100F),
+      backgroundColor: AppColors.bg,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF171D1C),
+        backgroundColor: AppColors.surface,
         title: const Text("Ошибки (DTC)"),
         actions: [
           IconButton(
-              icon: const Icon(Icons.history),
+              icon: Icon(Icons.history),
               tooltip: "Журнал проверок",
               onPressed: () => Navigator.of(context).push(
                   MaterialPageRoute(builder: (_) => const DtcHistoryScreen()))),
           if (conn.isConnected && _loaded)
             IconButton(
-                icon: const Icon(Icons.refresh),
+                icon: Icon(Icons.refresh),
                 tooltip: "Пересканировать",
                 onPressed: _loading ? null : _scan),
           _StatusChip(conn.link),
@@ -3072,16 +3110,16 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
                         ? null
                         : (v) => setState(() => _allBlocks = v),
                     activeColor: AppColors.accent,
-                    title: const Text("По всем блокам",
+                    title: Text("По всем блокам",
                         style: TextStyle(color: AppColors.text, fontSize: 14)),
-                    subtitle: const Text(
+                    subtitle: Text(
                         "Все ЭБУ шины + UDS-модули (ABS/SRS/АКПП — эксперимент)",
                         style: TextStyle(color: AppColors.textDim, fontSize: 12)),
                   ),
                 ),
                 if (_error != null) ...[
                   const SizedBox(height: 12),
-                  Text(_error!, style: const TextStyle(color: AppColors.err)),
+                  Text(_error!, style: TextStyle(color: AppColors.err)),
                 ],
                 if (_loading) ...[
                   const SizedBox(height: 14),
@@ -3089,7 +3127,7 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
                     padding: const EdgeInsets.all(14),
                     decoration: panelDecoration(),
                     child: Row(children: [
-                      const SizedBox(
+                      SizedBox(
                         width: 20,
                         height: 20,
                         child: CircularProgressIndicator(
@@ -3098,7 +3136,7 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
                       const SizedBox(width: 14),
                       Expanded(
                         child: Text(_progress ?? "Сканирую…",
-                            style: const TextStyle(
+                            style: TextStyle(
                                 color: AppColors.text, fontSize: 13.5)),
                       ),
                     ]),
@@ -3118,9 +3156,9 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
                   if (total == 0 && _modules.isEmpty && !_loading)
                     Padding(
                       padding: const EdgeInsets.only(top: 24),
-                      child: Column(children: const [
+                      child: Column(children: [
                         Icon(Icons.verified, color: AppColors.ok, size: 48),
-                        SizedBox(height: 10),
+                        const SizedBox(height: 10),
                         Text("Ошибок не найдено",
                             style: TextStyle(color: AppColors.text, fontSize: 16)),
                       ]),
@@ -3141,7 +3179,7 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
                         backgroundColor: AppColors.accent,
                         padding: const EdgeInsets.symmetric(vertical: 14),
                       ),
-                      icon: const Icon(Icons.search),
+                      icon: Icon(Icons.search),
                       label: Text(_loaded ? "Пересканировать" : "Сканировать ошибки"),
                       onPressed: _loading ? null : _scan,
                     ),
@@ -3151,10 +3189,10 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
                     child: OutlinedButton.icon(
                       style: OutlinedButton.styleFrom(
                         foregroundColor: AppColors.err,
-                        side: const BorderSide(color: AppColors.err),
+                        side: BorderSide(color: AppColors.err),
                         padding: const EdgeInsets.symmetric(vertical: 14),
                       ),
-                      icon: const Icon(Icons.delete_outline),
+                      icon: Icon(Icons.delete_outline),
                       label: const Text("Сброс"),
                       onPressed: _stored.isEmpty || _loading ? null : _clear,
                     ),
@@ -3207,7 +3245,7 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
                             : mil
                                 ? "Check Engine горит"
                                 : "Check Engine не горит",
-                style: const TextStyle(
+                style: TextStyle(
                     color: AppColors.text, fontSize: 16, fontWeight: FontWeight.w700),
               ),
               const SizedBox(height: 2),
@@ -3215,7 +3253,7 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
                 !_loaded
                     ? "Нажмите «Сканировать ошибки»"
                     : "Сохранённых: ${_stored.length} • ожидающих: ${_pending.length} • постоянных: ${_permanent.length}",
-                style: const TextStyle(color: AppColors.textDim, fontSize: 12.5),
+                style: TextStyle(color: AppColors.textDim, fontSize: 12.5),
               ),
             ],
           ),
@@ -3239,7 +3277,7 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
               const SizedBox(width: 8),
               Expanded(
                 child: Text(m.module,
-                    style: const TextStyle(
+                    style: TextStyle(
                         color: AppColors.text,
                         fontSize: 14,
                         fontWeight: FontWeight.w600)),
@@ -3250,11 +3288,11 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
                   decoration: BoxDecoration(
                       color: AppColors.accent2.withOpacity(0.16),
                       borderRadius: BorderRadius.circular(7)),
-                  child: const Text("UDS",
+                  child: Text("UDS",
                       style: TextStyle(color: AppColors.accent2, fontSize: 10.5)),
                 ),
               const SizedBox(width: 6),
-              Text(m.address, style: const TextStyle(color: AppColors.textDim, fontSize: 11)),
+              Text(m.address, style: TextStyle(color: AppColors.textDim, fontSize: 11)),
             ]),
             const SizedBox(height: 10),
             Wrap(
@@ -3296,7 +3334,7 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
         ]),
         Padding(
           padding: const EdgeInsets.only(left: 12, bottom: 6),
-          child: Text(hint, style: const TextStyle(color: AppColors.textDim, fontSize: 11.5)),
+          child: Text(hint, style: TextStyle(color: AppColors.textDim, fontSize: 11.5)),
         ),
         ...codes.map((c) {
           final info = DtcCatalog.describe(c);
@@ -3323,7 +3361,7 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(info.code,
-                              style: const TextStyle(
+                              style: TextStyle(
                                   color: AppColors.text,
                                   fontSize: 16,
                                   fontWeight: FontWeight.w700)),
@@ -3331,12 +3369,12 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
                           Text(info.description,
                               maxLines: 2,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
+                              style: TextStyle(
                                   color: AppColors.textDim, fontSize: 12.5)),
                         ],
                       ),
                     ),
-                    const Icon(Icons.chevron_right, color: AppColors.textDim),
+                    Icon(Icons.chevron_right, color: AppColors.textDim),
                   ]),
                 ),
               ),
@@ -3363,23 +3401,23 @@ class DtcHistoryScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final logs = ref.watch(dtcLogProvider);
     return Scaffold(
-      backgroundColor: const Color(0xFF0C100F),
+      backgroundColor: AppColors.bg,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF171D1C),
+        backgroundColor: AppColors.surface,
         title: const Text("Журнал проверок"),
         actions: [
           if (logs.isNotEmpty)
             IconButton(
-              icon: const Icon(Icons.delete_sweep),
+              icon: Icon(Icons.delete_sweep),
               tooltip: "Очистить журнал",
               onPressed: () async {
                 final ok = await showDialog<bool>(
                   context: context,
                   builder: (_) => AlertDialog(
                     backgroundColor: AppColors.surface,
-                    title: const Text("Очистить журнал?",
+                    title: Text("Очистить журнал?",
                         style: TextStyle(color: AppColors.text)),
-                    content: const Text("Вся сохранённая история проверок будет удалена.",
+                    content: Text("Вся сохранённая история проверок будет удалена.",
                         style: TextStyle(color: AppColors.textDim)),
                     actions: [
                       TextButton(
@@ -3398,7 +3436,7 @@ class DtcHistoryScreen extends ConsumerWidget {
         ],
       ),
       body: logs.isEmpty
-          ? const Center(
+          ? Center(
               child: Text("Пока нет сохранённых проверок",
                   style: TextStyle(color: AppColors.textDim)))
           : ListView.builder(
@@ -3423,7 +3461,7 @@ class DtcHistoryScreen extends ConsumerWidget {
                             color: e.milOn ? AppColors.err : AppColors.ok, size: 18),
                         const SizedBox(width: 8),
                         Text(_fmtDate(e.time),
-                            style: const TextStyle(
+                            style: TextStyle(
                                 color: AppColors.text,
                                 fontSize: 14,
                                 fontWeight: FontWeight.w600)),
@@ -3498,9 +3536,9 @@ class _FreezeFrameScreenState extends ConsumerState<FreezeFrameScreen> {
   Widget build(BuildContext context) {
     final conn = ref.watch(connectionProvider);
     return Scaffold(
-      backgroundColor: const Color(0xFF0C100F),
+      backgroundColor: AppColors.bg,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF171D1C),
+        backgroundColor: AppColors.surface,
         title: const Text("Стоп-кадр"),
         actions: [_StatusChip(conn.link)],
       ),
@@ -3516,7 +3554,7 @@ class _FreezeFrameScreenState extends ConsumerState<FreezeFrameScreen> {
                       style: TextStyle(color: Colors.white54, fontSize: 13)),
                   const SizedBox(height: 12),
                   FilledButton.icon(
-                    icon: const Icon(Icons.download),
+                    icon: Icon(Icons.download),
                     label: const Text("Прочитать стоп-кадр"),
                     onPressed: _loading ? null : _read,
                   ),
@@ -3601,9 +3639,9 @@ class _EcuIdScreenState extends ConsumerState<EcuIdScreen> {
   Widget build(BuildContext context) {
     final conn = ref.watch(connectionProvider);
     return Scaffold(
-      backgroundColor: const Color(0xFF0C100F),
+      backgroundColor: AppColors.bg,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF171D1C),
+        backgroundColor: AppColors.surface,
         title: const Text("Идентификаторы ЭБУ"),
         actions: [_StatusChip(conn.link)],
       ),
@@ -3615,7 +3653,7 @@ class _EcuIdScreenState extends ConsumerState<EcuIdScreen> {
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   FilledButton.icon(
-                    icon: const Icon(Icons.download),
+                    icon: Icon(Icons.download),
                     label: const Text("Считать идентификаторы"),
                     onPressed: _loading ? null : _read,
                   ),
@@ -3639,7 +3677,7 @@ class _EcuIdScreenState extends ConsumerState<EcuIdScreen> {
 
   Widget _idCard(String label, String? value) {
     return Card(
-      color: const Color(0xFF171D1C),
+      color: AppColors.surface,
       child: ListTile(
         title: Text(label, style: const TextStyle(color: Colors.white54, fontSize: 13)),
         subtitle: SelectableText(
@@ -3688,9 +3726,9 @@ class _EmissionsScreenState extends ConsumerState<EmissionsScreen> {
     final conn = ref.watch(connectionProvider);
     final d = _data;
     return Scaffold(
-      backgroundColor: const Color(0xFF0C100F),
+      backgroundColor: AppColors.bg,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF171D1C),
+        backgroundColor: AppColors.surface,
         title: const Text("Тесты на выбросы"),
         actions: [_StatusChip(conn.link)],
       ),
@@ -3702,7 +3740,7 @@ class _EmissionsScreenState extends ConsumerState<EmissionsScreen> {
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   FilledButton.icon(
-                    icon: const Icon(Icons.download),
+                    icon: Icon(Icons.download),
                     label: const Text("Проверить готовность"),
                     onPressed: _loading ? null : _read,
                   ),
@@ -3776,14 +3814,14 @@ class StatisticsScreen extends ConsumerWidget {
     final stats = svc?.statistics ?? const <String, MinMax>{};
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0C100F),
+      backgroundColor: AppColors.bg,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF171D1C),
+        backgroundColor: AppColors.surface,
         title: const Text("Статистика"),
         actions: [
           if (svc != null)
             IconButton(
-              icon: const Icon(Icons.refresh),
+              icon: Icon(Icons.refresh),
               tooltip: "Сбросить",
               onPressed: () => svc.resetStatistics(),
             ),
@@ -3901,7 +3939,7 @@ class _DataLoggingScreenState extends ConsumerState<DataLoggingScreen> {
     showDialog(
       context: context,
       builder: (_) => AlertDialog(
-        backgroundColor: const Color(0xFF171D1C),
+        backgroundColor: AppColors.surface,
         title: Text("CSV • строк: ${_rows.length}",
             style: const TextStyle(color: Colors.white)),
         content: SizedBox(
@@ -3929,9 +3967,9 @@ class _DataLoggingScreenState extends ConsumerState<DataLoggingScreen> {
   Widget build(BuildContext context) {
     final conn = ref.watch(connectionProvider);
     return Scaffold(
-      backgroundColor: const Color(0xFF0C100F),
+      backgroundColor: AppColors.bg,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF171D1C),
+        backgroundColor: AppColors.surface,
         title: const Text("Запись данных"),
         actions: [_StatusChip(conn.link)],
       ),
@@ -3962,7 +4000,7 @@ class _DataLoggingScreenState extends ConsumerState<DataLoggingScreen> {
                       ),
                       const SizedBox(width: 8),
                       IconButton(
-                        icon: const Icon(Icons.delete_outline, color: Colors.white54),
+                        icon: Icon(Icons.delete_outline, color: Colors.white54),
                         onPressed: _rows.isEmpty ? null : _clear,
                       ),
                     ],
@@ -4067,9 +4105,9 @@ class _AccelerationScreenState extends ConsumerState<AccelerationScreen> {
   Widget build(BuildContext context) {
     final conn = ref.watch(connectionProvider);
     return Scaffold(
-      backgroundColor: const Color(0xFF0C100F),
+      backgroundColor: AppColors.bg,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF171D1C),
+        backgroundColor: AppColors.surface,
         title: const Text("Замер разгона"),
         actions: [_StatusChip(conn.link)],
       ),
@@ -4096,7 +4134,7 @@ class _AccelerationScreenState extends ConsumerState<AccelerationScreen> {
                   _resultRow("0–100 км/ч", _fmt(_t100)),
                   const SizedBox(height: 32),
                   FilledButton.icon(
-                    icon: const Icon(Icons.flag),
+                    icon: Icon(Icons.flag),
                     label: Text(_armed ? "Ожидание старта…" : "Подготовить замер"),
                     onPressed: _armed ? null : _arm,
                   ),
@@ -4139,7 +4177,7 @@ class MyCarsScreen extends ConsumerWidget {
     final ok = await showDialog<bool>(
       context: context,
       builder: (_) => AlertDialog(
-        backgroundColor: const Color(0xFF171D1C),
+        backgroundColor: AppColors.surface,
         title: const Text("Новый автомобиль", style: TextStyle(color: Colors.white)),
         content: Column(
           mainAxisSize: MainAxisSize.min,
@@ -4177,29 +4215,29 @@ class MyCarsScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final cars = ref.watch(vehiclesProvider);
     return Scaffold(
-      backgroundColor: const Color(0xFF0C100F),
+      backgroundColor: AppColors.bg,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF171D1C),
+        backgroundColor: AppColors.surface,
         title: const Text("Мои автомобили"),
       ),
       floatingActionButton: FloatingActionButton(
         onPressed: () => _add(context, ref),
-        child: const Icon(Icons.add),
+        child: Icon(Icons.add),
       ),
       body: ListView.builder(
         itemCount: cars.length,
         itemBuilder: (_, i) {
           final c = cars[i];
           return Card(
-            color: const Color(0xFF171D1C),
+            color: AppColors.surface,
             margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
             child: ListTile(
-              leading: const Icon(Icons.directions_car, color: Colors.cyanAccent),
+              leading: Icon(Icons.directions_car, color: Colors.cyanAccent),
               title: Text(c.name, style: const TextStyle(color: Colors.white)),
               subtitle: Text(c.vin.isEmpty ? "VIN не указан" : c.vin,
                   style: const TextStyle(color: Colors.white54)),
               trailing: IconButton(
-                icon: const Icon(Icons.delete_outline, color: Colors.white38),
+                icon: Icon(Icons.delete_outline, color: Colors.white38),
                 onPressed: () => ref.read(vehiclesProvider.notifier).removeAt(i),
               ),
             ),
@@ -4224,16 +4262,66 @@ class SettingsScreen extends ConsumerWidget {
     final interval = ref.watch(pollIntervalMsProvider);
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0C100F),
+      backgroundColor: AppColors.bg,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF171D1C),
+        backgroundColor: AppColors.surface,
         title: const Text("Настройки"),
       ),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          const Text("Тип адаптера",
-              style: TextStyle(color: Colors.white54, fontSize: 13)),
+          Text("Внешний вид",
+              style: TextStyle(color: AppColors.textDim, fontSize: 13)),
+          const SizedBox(height: 8),
+          Container(
+            decoration: panelDecoration(),
+            child: SwitchListTile(
+              value: ref.watch(isDarkThemeProvider),
+              activeColor: AppColors.accent,
+              title: Text("Тёмная тема", style: TextStyle(color: AppColors.text)),
+              subtitle: Text(
+                  ref.watch(isDarkThemeProvider) ? "Графит" : "Светлый фон",
+                  style: TextStyle(color: AppColors.textDim, fontSize: 12)),
+              onChanged: (v) {
+                ref.read(isDarkThemeProvider.notifier).state = v;
+                ref.read(prefsProvider).setBool("darkTheme", v);
+              },
+            ),
+          ),
+          const SizedBox(height: 12),
+          Text("Акцент", style: TextStyle(color: AppColors.textDim, fontSize: 13)),
+          const SizedBox(height: 8),
+          Row(
+            children: AppColors.accents.entries.map((e) {
+              final selected = ref.watch(accentKeyProvider) == e.key;
+              return Padding(
+                padding: const EdgeInsets.only(right: 12),
+                child: GestureDetector(
+                  onTap: () {
+                    ref.read(accentKeyProvider.notifier).state = e.key;
+                    ref.read(prefsProvider).setString("accentKey", e.key);
+                  },
+                  child: Container(
+                    width: 44,
+                    height: 44,
+                    decoration: BoxDecoration(
+                      color: e.value,
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                          color: selected ? AppColors.text : Colors.transparent,
+                          width: 3),
+                    ),
+                    child: selected
+                        ? const Icon(Icons.check, color: Colors.white, size: 20)
+                        : null,
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+          const SizedBox(height: 24),
+          Text("Тип адаптера",
+              style: TextStyle(color: AppColors.textDim, fontSize: 13)),
           const SizedBox(height: 8),
           SegmentedButton<TransportKind>(
             segments: const [
@@ -4314,28 +4402,35 @@ Future<void> main() async {
   );
 }
 
-class ObdApp extends StatelessWidget {
+class ObdApp extends ConsumerWidget {
   const ObdApp({super.key});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final dark = ref.watch(isDarkThemeProvider);
+    final accentKey = ref.watch(accentKeyProvider);
+    // Применяем выбранную палитру до построения дерева.
+    AppColors.apply(dark: dark, accentKey: accentKey);
+
     final scheme = ColorScheme.fromSeed(
       seedColor: AppColors.accent,
-      brightness: Brightness.dark,
+      brightness: dark ? Brightness.dark : Brightness.light,
     ).copyWith(
       surface: AppColors.surface,
       secondary: AppColors.accent2,
     );
     return MaterialApp(
+      // Ключ зависит от темы — при смене всё дерево пересобирается с новой палитрой.
+      key: ValueKey("$dark-$accentKey"),
       title: "Revoscan",
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
-        brightness: Brightness.dark,
+        brightness: dark ? Brightness.dark : Brightness.light,
         scaffoldBackgroundColor: AppColors.bg,
         colorScheme: scheme,
         fontFamily: 'Roboto',
-        snackBarTheme: const SnackBarThemeData(
+        snackBarTheme: SnackBarThemeData(
           backgroundColor: AppColors.surface2,
           contentTextStyle: TextStyle(color: AppColors.text),
         ),
