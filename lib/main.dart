@@ -679,6 +679,8 @@ class ObdService {
 
   Timer? _pollTimer;
   int _consecutiveTimeouts = 0;
+  Duration _pollInterval = const Duration(milliseconds: 200);
+  bool _pollInFlight = false; // защита от наложения циклов опроса
 
   ObdService(this.transport) {
     _conn = ObdConnection(transport);
@@ -702,13 +704,41 @@ class ObdService {
 
   /// Запустить периодический опрос (poll loop) с заданной частотой.
   void startPolling({Duration interval = const Duration(milliseconds: 200)}) {
+    _pollInterval = interval;
     _pollTimer?.cancel();
     _pollTimer = Timer.periodic(interval, (_) => _pollOnce());
   }
 
-  void stopPolling() => _pollTimer?.cancel();
+  void stopPolling() {
+    _pollTimer?.cancel();
+    _pollTimer = null;
+  }
+
+  /// Возобновить опрос с ранее заданным интервалом (после паузы).
+  void resumePolling() {
+    if (_pollTimer == null) startPolling(interval: _pollInterval);
+  }
+
+  bool get isPolling => _pollTimer != null;
+
+  /// Сбросить накопившийся хвост команд опроса — чтобы пользовательская
+  /// операция (чтение/сброс ошибок) не ждала за длинной очередью телеметрии.
+  void clearQueue() => _queue.clear();
 
   Future<void> _pollOnce() async {
+    // На медленном адаптере один цикл может длиться дольше интервала таймера.
+    // Без этой защиты вызовы накладывались бы и забивали очередь команд,
+    // из-за чего пользовательские запросы (DTC) ждали бы бесконечно.
+    if (_pollInFlight) return;
+    _pollInFlight = true;
+    try {
+      await _pollCycle();
+    } finally {
+      _pollInFlight = false;
+    }
+  }
+
+  Future<void> _pollCycle() async {
     // Все команды идут через очередь, поэтому не накладываются.
     await _read(Pid.rpm.cmd, (r) {
       final v = ObdParsers.rpm(r);
@@ -812,6 +842,9 @@ class ObdService {
   }
 
   Future<void> _read(String cmd, void Function(String) onOk) async {
+    // Опрос мог быть остановлен посреди цикла (пауза на время чтения DTC) —
+    // тогда не добавляем оставшиеся команды цикла в очередь.
+    if (_pollTimer == null) return;
     try {
       final resp = await _queue.enqueue(cmd);
       _consecutiveTimeouts = 0; // успех — сбрасываем счётчик
@@ -2488,32 +2521,70 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
   bool _loading = false;
   bool _loaded = false;
   String? _error;
+  String? _progress; // текущий шаг сканирования
 
   ObdService? get _svc => ref.read(connectionProvider.notifier).service;
+
+  void _step(String s) {
+    if (mounted) setState(() => _progress = s);
+  }
 
   Future<void> _scan() async {
     final svc = _svc;
     if (svc == null) return;
+
+    // Ставим опрос телеметрии на паузу и чистим очередь, иначе команды чтения
+    // ошибок встают в хвост постоянного потока опроса и могут ждать очень долго.
+    final wasPolling = svc.isPolling;
+    svc.stopPolling();
+    svc.clearQueue();
+
     setState(() {
       _loading = true;
+      _loaded = true; // показываем секции по мере поступления
       _error = null;
+      _readiness = null;
+      _stored = [];
+      _pending = [];
+      _permanent = [];
     });
+
     try {
+      _step("Проверяю мониторы (Check Engine)…");
       try {
         _readiness = await svc.readReadiness();
+        if (mounted) setState(() {});
       } catch (_) {/* не критично */}
-      _stored = await svc.readDtc();
+
+      _step("Читаю сохранённые коды…");
       try {
-        _pending = await svc.readPendingDtc();
-      } catch (_) {}
+        final s = await svc.readDtc();
+        if (mounted) setState(() => _stored = s);
+      } catch (e) {
+        _step("Сохранённые коды: ошибка чтения");
+      }
+
+      _step("Читаю ожидающие коды…");
       try {
-        _permanent = await svc.readPermanentDtc();
-      } catch (_) {}
-      _loaded = true;
+        final p = await svc.readPendingDtc();
+        if (mounted) setState(() => _pending = p);
+      } catch (_) {/* режим 07 поддерживают не все ЭБУ */}
+
+      _step("Читаю постоянные коды…");
+      try {
+        final pm = await svc.readPermanentDtc();
+        if (mounted) setState(() => _permanent = pm);
+      } catch (_) {/* режим 0A поддерживают не все ЭБУ */}
     } catch (e) {
-      setState(() => _error = "$e");
+      if (mounted) setState(() => _error = "$e");
     } finally {
-      if (mounted) setState(() => _loading = false);
+      if (wasPolling) svc.resumePolling();
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _progress = null;
+        });
+      }
     }
   }
 
@@ -2540,15 +2611,31 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
       ),
     );
     if (ok != true) return;
+
+    // Сброс — запись в шину; так же убираем фон опроса, чтобы команда
+    // не ждала в очереди телеметрии.
+    final wasPolling = svc.isPolling;
+    svc.stopPolling();
+    svc.clearQueue();
+    setState(() {
+      _loading = true;
+      _progress = "Отправляю команду сброса…";
+    });
     try {
       await svc.clearDtc(userConfirmed: true);
-      await _scan();
+      if (wasPolling) svc.resumePolling();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text("Команда сброса отправлена")));
+            const SnackBar(content: Text("Сброс выполнен — перечитываю коды")));
       }
+      await _scan(); // покажет актуальное состояние пошагово
     } catch (e) {
+      if (wasPolling) svc.resumePolling();
       if (mounted) {
+        setState(() {
+          _loading = false;
+          _progress = null;
+        });
         ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(content: Text("$e"), backgroundColor: AppColors.err));
       }
@@ -2649,17 +2736,34 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
                   Text(_error!, style: const TextStyle(color: AppColors.err)),
                 ],
                 if (_loading) ...[
-                  const SizedBox(height: 16),
-                  const Center(child: CircularProgressIndicator()),
+                  const SizedBox(height: 14),
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: panelDecoration(),
+                    child: Row(children: [
+                      const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2.4, color: AppColors.accent),
+                      ),
+                      const SizedBox(width: 14),
+                      Expanded(
+                        child: Text(_progress ?? "Сканирую…",
+                            style: const TextStyle(
+                                color: AppColors.text, fontSize: 13.5)),
+                      ),
+                    ]),
+                  ),
                 ],
-                if (_loaded && !_loading) ...[
+                if (_loaded) ...[
                   _section("Сохранённые", _stored, AppColors.err,
                       "Подтверждённые коды — горит Check Engine"),
                   _section("Ожидающие", _pending, AppColors.warn,
                       "Замечены, но ещё не подтверждены"),
                   _section("Постоянные", _permanent, AppColors.accent2,
                       "Сканером не стираются, гаснут сами"),
-                  if (total == 0)
+                  if (total == 0 && !_loading)
                     Padding(
                       padding: const EdgeInsets.only(top: 24),
                       child: Column(children: const [
@@ -2710,21 +2814,31 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
   }
 
   Widget _summaryCard(int total) {
+    final known = _readiness != null;
     final mil = _readiness?.milOn ?? false;
+    final showAlert = known && mil;
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: panelDecoration(
-          border: (_loaded && total > 0) ? AppColors.err.withOpacity(0.4) : null),
+          border: (_loaded && !_loading && total > 0)
+              ? AppColors.err.withOpacity(0.4)
+              : null),
       child: Row(children: [
         Container(
           width: 54,
           height: 54,
           decoration: BoxDecoration(
-            color: (mil ? AppColors.err : AppColors.ok).withOpacity(0.15),
+            color: (showAlert ? AppColors.err : AppColors.ok).withOpacity(0.15),
             shape: BoxShape.circle,
           ),
-          child: Icon(mil ? Icons.warning_amber_rounded : Icons.check_circle,
-              color: mil ? AppColors.err : AppColors.ok, size: 28),
+          child: Icon(
+              _loading
+                  ? Icons.hourglass_top
+                  : showAlert
+                      ? Icons.warning_amber_rounded
+                      : Icons.check_circle,
+              color: showAlert ? AppColors.err : AppColors.ok,
+              size: 28),
         ),
         const SizedBox(width: 14),
         Expanded(
@@ -2732,11 +2846,15 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                !_loaded
-                    ? "Готов к сканированию"
-                    : mil
-                        ? "Check Engine горит"
-                        : "Check Engine не горит",
+                _loading
+                    ? "Сканирование…"
+                    : !_loaded
+                        ? "Готов к сканированию"
+                        : !known
+                            ? "Сканирование завершено"
+                            : mil
+                                ? "Check Engine горит"
+                                : "Check Engine не горит",
                 style: const TextStyle(
                     color: AppColors.text, fontSize: 16, fontWeight: FontWeight.w700),
               ),
