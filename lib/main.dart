@@ -135,9 +135,15 @@ class ObdParsers {
   }
 
   /// Напряжение по команде ELM327 "ATRV" (не OBD-PID, особый ответ "12.3V").
+  /// Из-за рассинхронизации очереди на дешёвых адаптерах сюда иногда попадает
+  /// ответ другого PID (напр. "410419"), поэтому достаём первое число регуляркой
+  /// и проверяем правдоподобный диапазон бортовой сети (5..30 В).
   static double? voltage(String resp) {
-    final clean = resp.replaceAll("V", "");
-    return double.tryParse(clean);
+    final m = RegExp(r'(\d{1,2}(?:\.\d+)?)').firstMatch(resp.replaceAll(',', '.'));
+    if (m == null) return null;
+    final v = double.tryParse(m.group(1)!);
+    if (v == null || v < 5 || v > 30) return null;
+    return v;
   }
 
   // ─────────────── РАСШИРЕННЫЕ PID ───────────────
@@ -515,7 +521,7 @@ class ObdConnection {
   /// Отправляет одну команду и ждёт цельный ответ или таймаут.
   Future<String> send(
     String cmd, {
-    Duration timeout = const Duration(milliseconds: 1500),
+    Duration timeout = const Duration(milliseconds: 2500),
   }) {
     _buffer.clear(); // чистим хвосты предыдущего обмена
     final completer = Completer<String>();
@@ -809,7 +815,11 @@ class ObdService {
   // ЭБУ на запрос 0100 возвращает битовую маску: какие PID 01-20 поддержаны.
   final Set<String> _supported = {};
 
-  bool _supports(String pid) => _supported.contains(pid.toUpperCase());
+  // Если детекция поддержки не прошла (частый случай при переподключении),
+  // _supported пуст — тогда опрашиваем расширенные PID оптимистично, а не
+  // прячем их. Неподдержанные просто вернут NODATA → значение останется пустым.
+  bool _supports(String pid) =>
+      _supported.isEmpty || _supported.contains(pid.toUpperCase());
 
   /// Запрашивает маски поддержки (0100, 0120, 0140) и заполняет _supported.
   /// Вызывается один раз после initialize().
@@ -850,12 +860,10 @@ class ObdService {
       _consecutiveTimeouts = 0; // успех — сбрасываем счётчик
       onOk(resp);
     } on TimeoutException {
+      // НЕ останавливаем опрос: на дешёвых адаптерах таймауты случаются, но
+      // линк жив (обрыв ловит транспорт по linkState). Раньше 3 таймаута
+      // насовсем глушили опрос → телеметрия «замерзала» с частью данных.
       _consecutiveTimeouts++;
-      // 3 таймаута подряд → линк, скорее всего, умер
-      if (_consecutiveTimeouts >= 3) {
-        stopPolling();
-        _telemetry.addError(StateError("Соединение потеряно"));
-      }
     } catch (_) {/* битый ответ — просто пропускаем кадр */}
   }
 
@@ -1387,8 +1395,10 @@ final wifiPortProvider = StateProvider<int>(
     (ref) => ref.watch(prefsProvider).getInt("wifiPort") ?? 35000);
 
 /// Частота опроса (мс между циклами).
+// 500 мс по умолчанию: дешёвым ELM327-клонам 200 мс слишком быстро —
+// команды не успевают, ответы рассинхронизируются и приходит мусор.
 final pollIntervalMsProvider = StateProvider<int>(
-    (ref) => ref.watch(prefsProvider).getInt("pollIntervalMs") ?? 200);
+    (ref) => ref.watch(prefsProvider).getInt("pollIntervalMs") ?? 500);
 
 /// Фабрика транспорта по выбранному типу.
 ObdTransport _buildTransport(TransportKind kind, {String? host, int? port}) {
@@ -2243,6 +2253,78 @@ final vehiclesProvider = StateNotifierProvider<VehiclesNotifier, List<Vehicle>>(
     (ref) => VehiclesNotifier(ref.watch(prefsProvider)));
 
 
+// ===== журнал проверок ошибок (история DTC) =====
+
+class DtcLogEntry {
+  final DateTime time;
+  final bool milOn;
+  final List<String> stored;
+  final List<String> pending;
+  final List<String> permanent;
+  const DtcLogEntry({
+    required this.time,
+    required this.milOn,
+    required this.stored,
+    required this.pending,
+    required this.permanent,
+  });
+
+  int get total => stored.length + pending.length + permanent.length;
+
+  Map<String, dynamic> toJson() => {
+        "t": time.millisecondsSinceEpoch,
+        "mil": milOn,
+        "s": stored,
+        "p": pending,
+        "pm": permanent,
+      };
+
+  factory DtcLogEntry.fromJson(Map<String, dynamic> j) => DtcLogEntry(
+        time: DateTime.fromMillisecondsSinceEpoch((j["t"] ?? 0) as int),
+        milOn: (j["mil"] ?? false) as bool,
+        stored: ((j["s"] ?? []) as List).cast<String>(),
+        pending: ((j["p"] ?? []) as List).cast<String>(),
+        permanent: ((j["pm"] ?? []) as List).cast<String>(),
+      );
+}
+
+/// История проверок DTC с сохранением в SharedPreferences (ключ "dtc_logs").
+/// Логи остаются между сеансами и видны без подключения.
+class DtcLogNotifier extends StateNotifier<List<DtcLogEntry>> {
+  final SharedPreferences _prefs;
+  static const _key = "dtc_logs";
+  static const _max = 50;
+
+  DtcLogNotifier(this._prefs) : super(_load(_prefs));
+
+  static List<DtcLogEntry> _load(SharedPreferences p) {
+    final raw = p.getString(_key);
+    if (raw == null) return const [];
+    try {
+      return (jsonDecode(raw) as List)
+          .map((e) => DtcLogEntry.fromJson(e as Map<String, dynamic>))
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  void add(DtcLogEntry e) {
+    state = [e, ...state].take(_max).toList();
+    _prefs.setString(_key, jsonEncode(state.map((x) => x.toJson()).toList()));
+  }
+
+  void clear() {
+    state = const [];
+    _prefs.remove(_key);
+  }
+}
+
+final dtcLogProvider =
+    StateNotifierProvider<DtcLogNotifier, List<DtcLogEntry>>(
+        (ref) => DtcLogNotifier(ref.watch(prefsProvider)));
+
+
 // ===== корневая оболочка с нижней навигацией =====
 
 class RootShell extends ConsumerStatefulWidget {
@@ -2575,6 +2657,20 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
         final pm = await svc.readPermanentDtc();
         if (mounted) setState(() => _permanent = pm);
       } catch (_) {/* режим 0A поддерживают не все ЭБУ */}
+
+      // Сохраняем результат в журнал, если связь реально отработала.
+      if (_readiness != null ||
+          _stored.isNotEmpty ||
+          _pending.isNotEmpty ||
+          _permanent.isNotEmpty) {
+        ref.read(dtcLogProvider.notifier).add(DtcLogEntry(
+              time: DateTime.now(),
+              milOn: _readiness?.milOn ?? false,
+              stored: _stored,
+              pending: _pending,
+              permanent: _permanent,
+            ));
+      }
     } catch (e) {
       if (mounted) setState(() => _error = "$e");
     } finally {
@@ -2717,6 +2813,11 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
         backgroundColor: const Color(0xFF171D1C),
         title: const Text("Ошибки (DTC)"),
         actions: [
+          IconButton(
+              icon: const Icon(Icons.history),
+              tooltip: "Журнал проверок",
+              onPressed: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const DtcHistoryScreen()))),
           if (conn.isConnected && _loaded)
             IconButton(
                 icon: const Icon(Icons.refresh),
@@ -2931,6 +3032,121 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
           );
         }),
       ],
+    );
+  }
+}
+
+
+// ===== экран «Журнал проверок ошибок» =====
+
+class DtcHistoryScreen extends ConsumerWidget {
+  const DtcHistoryScreen({super.key});
+
+  String _fmtDate(DateTime t) {
+    String two(int n) => n.toString().padLeft(2, '0');
+    return "${two(t.day)}.${two(t.month)}.${t.year} ${two(t.hour)}:${two(t.minute)}";
+  }
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final logs = ref.watch(dtcLogProvider);
+    return Scaffold(
+      backgroundColor: const Color(0xFF0C100F),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF171D1C),
+        title: const Text("Журнал проверок"),
+        actions: [
+          if (logs.isNotEmpty)
+            IconButton(
+              icon: const Icon(Icons.delete_sweep),
+              tooltip: "Очистить журнал",
+              onPressed: () async {
+                final ok = await showDialog<bool>(
+                  context: context,
+                  builder: (_) => AlertDialog(
+                    backgroundColor: AppColors.surface,
+                    title: const Text("Очистить журнал?",
+                        style: TextStyle(color: AppColors.text)),
+                    content: const Text("Вся сохранённая история проверок будет удалена.",
+                        style: TextStyle(color: AppColors.textDim)),
+                    actions: [
+                      TextButton(
+                          onPressed: () => Navigator.pop(context, false),
+                          child: const Text("Отмена")),
+                      FilledButton(
+                          style: FilledButton.styleFrom(backgroundColor: AppColors.err),
+                          onPressed: () => Navigator.pop(context, true),
+                          child: const Text("Очистить")),
+                    ],
+                  ),
+                );
+                if (ok == true) ref.read(dtcLogProvider.notifier).clear();
+              },
+            ),
+        ],
+      ),
+      body: logs.isEmpty
+          ? const Center(
+              child: Text("Пока нет сохранённых проверок",
+                  style: TextStyle(color: AppColors.textDim)))
+          : ListView.builder(
+              padding: const EdgeInsets.all(16),
+              itemCount: logs.length,
+              itemBuilder: (_, i) {
+                final e = logs[i];
+                final all = [
+                  ...e.stored.map((c) => (c, AppColors.err)),
+                  ...e.pending.map((c) => (c, AppColors.warn)),
+                  ...e.permanent.map((c) => (c, AppColors.accent2)),
+                ];
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 10),
+                  padding: const EdgeInsets.all(14),
+                  decoration: panelDecoration(),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(children: [
+                        Icon(e.milOn ? Icons.warning_amber_rounded : Icons.check_circle,
+                            color: e.milOn ? AppColors.err : AppColors.ok, size: 18),
+                        const SizedBox(width: 8),
+                        Text(_fmtDate(e.time),
+                            style: const TextStyle(
+                                color: AppColors.text,
+                                fontSize: 14,
+                                fontWeight: FontWeight.w600)),
+                        const Spacer(),
+                        Text(e.total == 0 ? "чисто" : "кодов: ${e.total}",
+                            style: TextStyle(
+                                color: e.total == 0 ? AppColors.ok : AppColors.err,
+                                fontSize: 12)),
+                      ]),
+                      if (all.isNotEmpty) ...[
+                        const SizedBox(height: 10),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: all
+                              .map((p) => Container(
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 10, vertical: 5),
+                                    decoration: BoxDecoration(
+                                        color: p.$2.withOpacity(0.16),
+                                        borderRadius: BorderRadius.circular(8)),
+                                    child: Text(p.$1,
+                                        style: TextStyle(
+                                            color: p.$2,
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w600)),
+                                  ))
+                              .toList(),
+                        ),
+                      ],
+                    ],
+                  ),
+                );
+              },
+            ),
     );
   }
 }
