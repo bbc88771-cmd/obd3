@@ -12,6 +12,22 @@ dependencies:
   flutter_riverpod: ^2.5.1
   flutter_blue_plus: ^1.32.0
   permission_handler: ^11.3.0
+  shared_preferences: ^2.2.0
+  path_provider: ^2.1.0
+  share_plus: ^10.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_launcher_icons: ^0.14.1
+
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "assets/icon/app_icon.png"
+  min_sdk_android: 21
+  adaptive_icon_background: "#0E1116"
+  adaptive_icon_foreground: "assets/icon/app_icon_foreground.png"
 
 flutter:
   uses-material-design: true
