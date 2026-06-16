@@ -30,6 +30,9 @@ jobs:
           sed -i 's|<application|<uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />\n    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />\n    <uses-permission android:name="android.permission.BLUETOOTH" />\n    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />\n    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />\n    <uses-permission android:name="android.permission.INTERNET" />\n    <application|' "$M"
           echo "=== манифест ==="; cat "$M"
 
+      - name: Сгенерировать иконку приложения
+        run: dart run flutter_launcher_icons
+
       - run: flutter build apk --release
       - uses: actions/upload-artifact@v4
         with:
