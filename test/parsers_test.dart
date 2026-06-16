@@ -96,4 +96,34 @@ void main() {
       expect(ObdParsers.freezeData('4205005A', '05'), [0x5A]);
     });
   });
+
+  group('ObdParsers — DTC по блокам (headers ON)', () {
+    test('строка ЭБУ 7E8 с байтом-счётчиком → [P0133, P0420]', () {
+      expect(ObdParsers.dtcFromLine('7E806430201330420', '43'),
+          ['P0133', 'P0420']);
+    });
+
+    test('строка ЭБУ 7E9 → [P0700]', () {
+      expect(ObdParsers.dtcFromLine('7E90443010700', '43'), ['P0700']);
+    });
+
+    test('заголовок ЭБУ из строки', () {
+      expect(ObdParsers.ecuHeaderBefore('7E806430201330420', '43'), '7E8');
+      expect(ObdParsers.ecuHeaderBefore('7E90443010700', '43'), '7E9');
+    });
+  });
+
+  group('ObdParsers — UDS (сервис 19 02)', () {
+    test('5902FF + P0133 (статус 2F) → [P0133]', () {
+      expect(ObdParsers.udsDtc('5902FF0133002F'), ['P0133']);
+    });
+
+    test('тип неисправности добавляется суффиксом', () {
+      expect(ObdParsers.udsDtc('5902FF01330142'), ['P0133-01']);
+    });
+
+    test('нет эха 5902 → пусто', () {
+      expect(ObdParsers.udsDtc('NODATA'), isEmpty);
+    });
+  });
 }

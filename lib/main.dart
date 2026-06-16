@@ -255,6 +255,68 @@ class ObdParsers {
     return codes;
   }
 
+  /// Код из 2 байт (формат OBD/UDS DTC).
+  static String _dtc2(int a, int b) {
+    const letters = ['P', 'C', 'B', 'U'];
+    final letter = letters[(a & 0xC0) >> 6];
+    final d1 = (a & 0x30) >> 4;
+    final d2 = a & 0x0F;
+    return "$letter$d1${d2.toRadixString(16)}${b.toRadixString(16).padLeft(2, '0')}"
+        .toUpperCase();
+  }
+
+  /// Заголовок ЭБУ из строки (когда headers ON): всё до кода режима, без
+  /// последнего байта PCI/длины. Напр. "7E80643..." c echo "43" → "7E8".
+  static String ecuHeaderBefore(String line, String echo) {
+    final idx = line.indexOf(echo);
+    if (idx <= 0) return "ECU";
+    var h = line.substring(0, idx);
+    if (h.length >= 5) h = h.substring(0, h.length - 2); // убираем байт длины
+    return h.isEmpty ? "ECU" : h;
+  }
+
+  /// Разбор кодов из ОДНОЙ строки ответа (один ЭБУ), headers ON.
+  /// Учитывает байт-счётчик DTC у CAN (когда длина «хвоста» нечётна в парах).
+  static List<String> dtcFromLine(String line, String echo) {
+    if (_isGarbage(line)) return [];
+    final idx = line.indexOf(echo);
+    if (idx < 0) return [];
+    var hex = line.substring(idx + echo.length);
+    if (hex.length % 4 == 2) hex = hex.substring(2); // CAN: отбрасываем счётчик
+    final codes = <String>[];
+    for (int i = 0; i + 4 <= hex.length; i += 4) {
+      final chunk = hex.substring(i, i + 4);
+      if (chunk == "0000") continue;
+      final a = int.tryParse(chunk.substring(0, 2), radix: 16);
+      final b = int.tryParse(chunk.substring(2), radix: 16);
+      if (a == null || b == null) continue;
+      final code = _dtc2(a, b);
+      if (!codes.contains(code)) codes.add(code);
+    }
+    return codes;
+  }
+
+  /// Разбор ответа UDS на сервис 19 02 (ReadDTCByStatusMask).
+  /// Формат: 59 02 <маска доступности> [<DTC 3 байта><статус 1 байт>]...
+  static List<String> udsDtc(String resp) {
+    final idx = resp.indexOf("5902");
+    if (idx < 0) return [];
+    var hex = resp.substring(idx + 4);
+    if (hex.length >= 2) hex = hex.substring(2); // байт маски доступности
+    final codes = <String>[];
+    for (int i = 0; i + 8 <= hex.length; i += 8) {
+      final b0 = int.tryParse(hex.substring(i, i + 2), radix: 16);
+      final b1 = int.tryParse(hex.substring(i + 2, i + 4), radix: 16);
+      final b2 = int.tryParse(hex.substring(i + 4, i + 6), radix: 16);
+      if (b0 == null || b1 == null || b2 == null) continue;
+      if (b0 == 0 && b1 == 0 && b2 == 0) continue;
+      var code = _dtc2(b0, b1);
+      if (b2 != 0) code += "-${b2.toRadixString(16).padLeft(2, '0').toUpperCase()}";
+      if (!codes.contains(code)) codes.add(code);
+    }
+    return codes;
+  }
+
   /// VIN (Mode 09, PID 02). Ответ многокадровый ISO-TP, но после нормализации
   /// (ATS0) приходит склеенной строкой. Ищем эхо "4902", пропускаем байт
   /// счётчика сообщений и переводим оставшиеся байты в ASCII.
@@ -373,6 +435,20 @@ class MonitorStatus {
   final bool supported;
   final bool complete; // true = тест завершён (готов)
   const MonitorStatus(this.name, this.supported, this.complete);
+}
+
+/// Отчёт по одному блоку (ЭБУ) при чтении ошибок «по всем блокам».
+class ModuleReport {
+  final String module;   // человекочитаемое имя блока
+  final String address;  // адрес/заголовок ЭБУ
+  final List<String> codes;
+  final bool experimental; // получено через UDS-эксперимент
+  const ModuleReport({
+    required this.module,
+    required this.address,
+    required this.codes,
+    this.experimental = false,
+  });
 }
 
 /// Расшифрованный код ошибки.
@@ -502,37 +578,54 @@ class ObdConnection {
 
     if (current.contains('>')) {
       _buffer.clear();
-      // нормализация: убираем приглашение, переводы строк и пробелы.
-      // (ATS0 обычно уже убрал пробелы, но подстраховываемся)
-      final clean = current
-          .replaceAll('>', '')
-          .replaceAll('\r', '')
-          .replaceAll('\n', '')
-          .replaceAll(' ', '')
-          .toUpperCase()
-          .trim();
-
+      // Отдаём «сырой» ответ, убрав только приглашение. Переводы строк
+      // сохраняем — они разделяют ответы разных ЭБУ (нужно для чтения
+      // ошибок по всем блокам). Очистку делает уже вызывающий код.
+      final raw = current.replaceAll('>', '');
       final p = _pending;
       _pending = null;
-      if (p != null && !p.isCompleted) p.complete(clean);
+      if (p != null && !p.isCompleted) p.complete(raw);
     }
   }
 
-  /// Отправляет одну команду и ждёт цельный ответ или таймаут.
-  Future<String> send(
-    String cmd, {
-    Duration timeout = const Duration(milliseconds: 2500),
-  }) {
+  Future<String> _sendRaw(String cmd, Duration timeout) {
     _buffer.clear(); // чистим хвосты предыдущего обмена
     final completer = Completer<String>();
     _pending = completer;
-
     transport.write(cmd);
-
     return completer.future.timeout(timeout, onTimeout: () {
       _pending = null;
       throw TimeoutException("Таймаут ответа на '$cmd'");
     });
+  }
+
+  static String _clean(String s) => s
+      .replaceAll('\r', '')
+      .replaceAll('\n', '')
+      .replaceAll(' ', '')
+      .toUpperCase()
+      .trim();
+
+  /// Отправляет команду и возвращает цельный ответ (склеенный, без пробелов).
+  Future<String> send(
+    String cmd, {
+    Duration timeout = const Duration(milliseconds: 2500),
+  }) async {
+    return _clean(await _sendRaw(cmd, timeout));
+  }
+
+  /// То же, но возвращает ответы построчно — по одной строке на ЭБУ/кадр.
+  /// Используется для чтения ошибок со всех блоков (headers ON).
+  Future<List<String>> sendLines(
+    String cmd, {
+    Duration timeout = const Duration(milliseconds: 2500),
+  }) async {
+    final raw = await _sendRaw(cmd, timeout);
+    return raw
+        .split(RegExp(r'[\r\n]'))
+        .map(_clean)
+        .where((l) => l.isNotEmpty)
+        .toList();
   }
 
   Future<void> dispose() async => _sub.cancel();
@@ -556,12 +649,20 @@ class RequestQueue {
 
   RequestQueue(this.conn, {this.gap = const Duration(milliseconds: 25)});
 
-  /// Поставить команду в очередь. Возвращает future с её ответом.
+  /// Поставить команду в очередь. Возвращает future с её ответом (склеенным).
   Future<String> enqueue(String cmd, {Duration? timeout}) {
-    final item = _Item(cmd, Completer<String>(), timeout);
+    final item = _Item(cmd, Completer<dynamic>(), timeout, false);
     _items.add(item);
-    _pump(); // запускаем «насос», если стоял
-    return item.completer.future;
+    _pump();
+    return item.completer.future.then((v) => v as String);
+  }
+
+  /// То же, но ответ возвращается построчно (для чтения ошибок по блокам).
+  Future<List<String>> enqueueLines(String cmd, {Duration? timeout}) {
+    final item = _Item(cmd, Completer<dynamic>(), timeout, true);
+    _items.add(item);
+    _pump();
+    return item.completer.future.then((v) => v as List<String>);
   }
 
   Future<void> _pump() async {
@@ -571,9 +672,12 @@ class RequestQueue {
     while (_items.isNotEmpty) {
       final item = _items.removeAt(0);
       try {
-        final resp = item.timeout != null
-            ? await conn.send(item.cmd, timeout: item.timeout!)
-            : await conn.send(item.cmd);
+        final dynamic resp = item.lines
+            ? await conn.sendLines(item.cmd,
+                timeout: item.timeout ?? const Duration(milliseconds: 2500))
+            : (item.timeout != null
+                ? await conn.send(item.cmd, timeout: item.timeout!)
+                : await conn.send(item.cmd));
         if (!item.completer.isCompleted) item.completer.complete(resp);
       } catch (e) {
         // один таймаут НЕ должен ронять всю очередь
@@ -597,9 +701,10 @@ class RequestQueue {
 
 class _Item {
   final String cmd;
-  final Completer<String> completer;
+  final Completer<dynamic> completer;
   final Duration? timeout;
-  _Item(this.cmd, this.completer, this.timeout);
+  final bool lines;
+  _Item(this.cmd, this.completer, this.timeout, this.lines);
 }
 
 
@@ -959,6 +1064,90 @@ class ObdService {
     return ObdParsers.dtcFrom(resp, "4A");
   }
 
+  // Известные ответные заголовки ЭБУ (11-bit CAN) → имя блока.
+  static const _ecuNames = {
+    "7E8": "Двигатель (ECM)",
+    "7E9": "АКПП/второй ЭБУ",
+    "7EA": "ЭБУ #3",
+    "7EB": "ЭБУ #4",
+  };
+
+  // Адреса для экспериментального UDS-опроса модулей (запрос → имя).
+  // Двигатель 7E0 точно отвечает; остальные — как повезёт (зависит от авто).
+  static const _udsTargets = <(String, String)>[
+    ("7E0", "Двигатель (UDS)"),
+    ("7E1", "АКПП (UDS)"),
+    ("760", "ABS (UDS)"),
+    ("715", "Подушки/SRS (UDS)"),
+    ("714", "Климат (UDS)"),
+  ];
+
+  /// Чтение ошибок СО ВСЕХ блоков, отвечающих по шине.
+  /// Включает заголовки (ATH1), читает Mode 03/07 со всех ЭБУ и группирует по
+  /// адресу. При uds=true дополнительно пробует UDS-сервис 19 02 по адресам
+  /// модулей (экспериментально — может ничего не вернуть).
+  /// Вызывать при остановленном опросе (как и обычное чтение DTC).
+  Future<List<ModuleReport>> readAllDtc({bool uds = false}) async {
+    final reports = <ModuleReport>[];
+
+    // 1) Стандартные режимы со всех ЭБУ шины (headers ON).
+    try {
+      await _queue.enqueue("ATH1");
+    } catch (_) {}
+    for (final entry in const [("03", "43"), ("07", "47")]) {
+      final mode = entry.$1, echo = entry.$2;
+      try {
+        final lines = await _queue.enqueueLines(mode, timeout: const Duration(seconds: 4));
+        final byEcu = <String, List<String>>{};
+        for (final line in lines) {
+          if (!line.contains(echo)) continue;
+          final codes = ObdParsers.dtcFromLine(line, echo);
+          if (codes.isEmpty) continue;
+          final h = ObdParsers.ecuHeaderBefore(line, echo);
+          byEcu.putIfAbsent(h, () => []).addAll(codes);
+        }
+        byEcu.forEach((h, codes) {
+          final existing = reports.where((r) => r.address == h && !r.experimental);
+          if (existing.isNotEmpty) {
+            for (final c in codes) {
+              if (!existing.first.codes.contains(c)) existing.first.codes.add(c);
+            }
+          } else {
+            reports.add(ModuleReport(
+                module: _ecuNames[h] ?? "ЭБУ $h", address: h, codes: [...codes]));
+          }
+        });
+      } catch (_) {/* режим/ЭБУ не ответил */}
+    }
+    try {
+      await _queue.enqueue("ATH0");
+    } catch (_) {}
+
+    // 2) Экспериментальный UDS-опрос модулей.
+    if (uds) {
+      for (final target in _udsTargets) {
+        final addr = target.$1, name = target.$2;
+        try {
+          await _queue.enqueue("ATSH$addr");
+          final resp = await _queue.enqueue("1902FF",
+              timeout: const Duration(milliseconds: 1500));
+          final codes = ObdParsers.udsDtc(resp);
+          if (codes.isNotEmpty) {
+            reports.add(ModuleReport(
+                module: name, address: addr, codes: codes, experimental: true));
+          }
+        } catch (_) {/* модуль не ответил по UDS */}
+      }
+      // вернуть стандартный заголовок/адресацию
+      try {
+        await _queue.enqueue("ATSH7E0");
+        await _queue.enqueue("ATH0");
+      } catch (_) {}
+    }
+
+    return reports;
+  }
+
   /// БЕЗОПАСНОСТЬ: проверка, что машина неподвижна перед записью.
   Future<bool> _isSafeToWrite() async {
     try {
@@ -1242,6 +1431,8 @@ class FakeTransport implements ObdTransport {
   final _rnd = Random();
   DateTime _start = DateTime.now();
   bool _connected = false;
+  bool _headers = false;   // ATH1/ATH0 — заголовки ЭБУ в ответе
+  String _header = "7E0";  // текущий ATSH (адрес для UDS)
 
   @override
   Stream<List<int>> get incoming => _incoming.stream;
@@ -1282,12 +1473,34 @@ class FakeTransport implements ObdTransport {
     final t = DateTime.now().difference(_start).inMilliseconds / 1000.0;
 
     // Служебные AT-команды.
-    if (cmd == "ATZ") return "ELM327 v1.5";
+    if (cmd == "ATZ") {
+      _headers = false;
+      _header = "7E0";
+      return "ELM327 v1.5";
+    }
     if (cmd == "ATRV") {
       final v = 13.8 + sin(t / 3) * 0.6;
       return "${v.toStringAsFixed(1)}V";
     }
+    if (cmd == "ATH1") {
+      _headers = true;
+      return "OK";
+    }
+    if (cmd == "ATH0") {
+      _headers = false;
+      return "OK";
+    }
+    if (cmd.startsWith("ATSH")) {
+      _header = cmd.substring(4);
+      return "OK";
+    }
     if (cmd.startsWith("AT")) return "OK";
+
+    // UDS (эксперимент): сервис 19 02 — в демо отвечает только двигатель 7E0.
+    if (cmd.startsWith("1902")) {
+      if (_header == "7E0") return "5902FF0133002F";
+      return "NODATA";
+    }
 
     // Маски поддержки PID — заявляем широкую поддержку.
     if (cmd == "0100") return "4100FFFFFFFE";
@@ -1298,9 +1511,16 @@ class FakeTransport implements ObdTransport {
     if (cmd == "0101") return "410100072100";
 
     // Коды ошибок (демо): сохранённые P0133, P0420.
-    if (cmd == "03") return "4301330420";
+    // С заголовками (ATH1) отвечаем как несколько ЭБУ на отдельных строках.
+    if (cmd == "03") {
+      return _headers
+          ? "7E806430201330420\r7E90443010700"
+          : "4301330420";
+    }
     // Ожидающие (Mode 07): P0301.
-    if (cmd == "07") return "470301";
+    if (cmd == "07") {
+      return _headers ? "7E80447010301" : "470301";
+    }
     // Постоянные (Mode 0A): P0420.
     if (cmd == "0A") return "4A0420";
     if (cmd == "04") return "44"; // сброс выполнен
@@ -2600,6 +2820,8 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
   List<String> _stored = [];
   List<String> _pending = [];
   List<String> _permanent = [];
+  List<ModuleReport> _modules = [];
+  bool _allBlocks = true; // читать ошибки по всем блокам (+UDS эксперимент)
   bool _loading = false;
   bool _loaded = false;
   String? _error;
@@ -2629,6 +2851,7 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
       _stored = [];
       _pending = [];
       _permanent = [];
+      _modules = [];
     });
 
     try {
@@ -2657,6 +2880,14 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
         final pm = await svc.readPermanentDtc();
         if (mounted) setState(() => _permanent = pm);
       } catch (_) {/* режим 0A поддерживают не все ЭБУ */}
+
+      if (_allBlocks) {
+        _step("Опрашиваю все блоки (ЭБУ шины + UDS)…");
+        try {
+          final mods = await svc.readAllDtc(uds: true);
+          if (mounted) setState(() => _modules = mods);
+        } catch (_) {/* расширенное чтение не удалось */}
+      }
 
       // Сохраняем результат в журнал, если связь реально отработала.
       if (_readiness != null ||
@@ -2832,6 +3063,22 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
               padding: const EdgeInsets.all(16),
               children: [
                 _summaryCard(total),
+                const SizedBox(height: 10),
+                Container(
+                  decoration: panelDecoration(),
+                  child: SwitchListTile(
+                    value: _allBlocks,
+                    onChanged: _loading
+                        ? null
+                        : (v) => setState(() => _allBlocks = v),
+                    activeColor: AppColors.accent,
+                    title: const Text("По всем блокам",
+                        style: TextStyle(color: AppColors.text, fontSize: 14)),
+                    subtitle: const Text(
+                        "Все ЭБУ шины + UDS-модули (ABS/SRS/АКПП — эксперимент)",
+                        style: TextStyle(color: AppColors.textDim, fontSize: 12)),
+                  ),
+                ),
                 if (_error != null) ...[
                   const SizedBox(height: 12),
                   Text(_error!, style: const TextStyle(color: AppColors.err)),
@@ -2864,7 +3111,11 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
                       "Замечены, но ещё не подтверждены"),
                   _section("Постоянные", _permanent, AppColors.accent2,
                       "Сканером не стираются, гаснут сами"),
-                  if (total == 0 && !_loading)
+                  if (_modules.isNotEmpty) ...[
+                    const SectionTitle("По блокам"),
+                    ..._modules.map(_moduleCard),
+                  ],
+                  if (total == 0 && _modules.isEmpty && !_loading)
                     Padding(
                       padding: const EdgeInsets.only(top: 24),
                       child: Column(children: const [
@@ -2970,6 +3221,67 @@ class _DtcScreenState extends ConsumerState<DtcScreen> {
           ),
         ),
       ]),
+    );
+  }
+
+  Widget _moduleCard(ModuleReport m) {
+    final color = m.experimental ? AppColors.accent2 : AppColors.accent;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Container(
+        padding: const EdgeInsets.all(14),
+        decoration: panelDecoration(),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              Icon(Icons.memory, color: color, size: 18),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(m.module,
+                    style: const TextStyle(
+                        color: AppColors.text,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600)),
+              ),
+              if (m.experimental)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                      color: AppColors.accent2.withOpacity(0.16),
+                      borderRadius: BorderRadius.circular(7)),
+                  child: const Text("UDS",
+                      style: TextStyle(color: AppColors.accent2, fontSize: 10.5)),
+                ),
+              const SizedBox(width: 6),
+              Text(m.address, style: const TextStyle(color: AppColors.textDim, fontSize: 11)),
+            ]),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: m.codes
+                  .map((c) => InkWell(
+                        borderRadius: BorderRadius.circular(8),
+                        onTap: () => _showDetail(c, m.module, color),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 10, vertical: 6),
+                          decoration: BoxDecoration(
+                              color: color.withOpacity(0.16),
+                              borderRadius: BorderRadius.circular(8)),
+                          child: Text(c,
+                              style: TextStyle(
+                                  color: color,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600)),
+                        ),
+                      ))
+                  .toList(),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
