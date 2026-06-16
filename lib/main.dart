@@ -8,6 +8,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 
 
 
@@ -241,7 +244,13 @@ class ObdParsers {
   /// VIN (Mode 09, PID 02). Ответ многокадровый ISO-TP, но после нормализации
   /// (ATS0) приходит склеенной строкой. Ищем эхо "4902", пропускаем байт
   /// счётчика сообщений и переводим оставшиеся байты в ASCII.
+  /// Убирает маркеры строк многокадрового ISO-TP ответа вида "0:", "1:", ...
+  /// ELM327 вставляет их перед каждым кадром; в чистом HEX символа ':' нет.
+  static String _stripFrameMarkers(String s) =>
+      s.replaceAll(RegExp(r'[0-9A-F]:'), '');
+
   static String? vin(String resp) {
+    resp = _stripFrameMarkers(resp);
     final idx = resp.indexOf("4902");
     if (idx < 0) return null;
     var hex = resp.substring(idx + 4);
@@ -261,6 +270,7 @@ class ObdParsers {
   /// Текстовый ответ Mode 09 (имя ЭБУ 090A, Calibration ID 0904 и т.п.).
   /// echoPrefix — например "490A". Возвращает читаемую ASCII-строку.
   static String? mode09Text(String resp, String echoPrefix) {
+    resp = _stripFrameMarkers(resp);
     final idx = resp.indexOf(echoPrefix);
     if (idx < 0) return null;
     var hex = resp.substring(idx + echoPrefix.length);
@@ -1220,20 +1230,31 @@ class FakeTransport implements ObdTransport {
 
 // ===== из connection_provider.dart =====
 
-/// Тип транспорта, выбранный пользователем.
-enum TransportKind { ble, btClassic, wifi }
+/// Доступ к SharedPreferences. Реальный экземпляр подставляется в main()
+/// через override, поэтому до инициализации обращаться к нему нельзя.
+final prefsProvider = Provider<SharedPreferences>(
+  (ref) => throw UnimplementedError("prefsProvider должен быть переопределён в main()"),
+);
+
+/// Тип транспорта, выбранный пользователем (BLE или Wi-Fi).
+enum TransportKind { ble, wifi }
 
 final transportKindProvider = StateProvider<TransportKind>((ref) {
-  // на iOS BT Classic недоступен — по умолчанию BLE
-  return TransportKind.ble;
+  final i = ref.watch(prefsProvider).getInt("transportKind");
+  return (i != null && i < TransportKind.values.length)
+      ? TransportKind.values[i]
+      : TransportKind.ble;
 });
 
 /// Настройки Wi-Fi-адаптера.
-final wifiHostProvider = StateProvider<String>((ref) => "192.168.0.10");
-final wifiPortProvider = StateProvider<int>((ref) => 35000);
+final wifiHostProvider = StateProvider<String>(
+    (ref) => ref.watch(prefsProvider).getString("wifiHost") ?? "192.168.0.10");
+final wifiPortProvider = StateProvider<int>(
+    (ref) => ref.watch(prefsProvider).getInt("wifiPort") ?? 35000);
 
 /// Частота опроса (мс между циклами).
-final pollIntervalMsProvider = StateProvider<int>((ref) => 200);
+final pollIntervalMsProvider = StateProvider<int>(
+    (ref) => ref.watch(prefsProvider).getInt("pollIntervalMs") ?? 200);
 
 /// Фабрика транспорта по выбранному типу.
 ObdTransport _buildTransport(TransportKind kind, {String? host, int? port}) {
@@ -1245,8 +1266,6 @@ ObdTransport _buildTransport(TransportKind kind, {String? host, int? port}) {
         host: host ?? "192.168.0.10",
         port: port ?? 35000,
       );
-    case TransportKind.btClassic:
-      return BleTransport(); // BT Classic убран
   }
 }
 
@@ -1759,16 +1778,48 @@ class Vehicle {
   final String name;
   final String vin;
   const Vehicle(this.name, this.vin);
+
+  Map<String, dynamic> toJson() => {"name": name, "vin": vin};
+  factory Vehicle.fromJson(Map<String, dynamic> j) =>
+      Vehicle((j["name"] ?? "") as String, (j["vin"] ?? "") as String);
 }
 
+/// Список автомобилей с сохранением в SharedPreferences (ключ "vehicles").
 class VehiclesNotifier extends StateNotifier<List<Vehicle>> {
-  VehiclesNotifier() : super(const [Vehicle("Мой автомобиль", "")]);
-  void add(Vehicle v) => state = [...state, v];
-  void removeAt(int i) => state = [...state]..removeAt(i);
+  final SharedPreferences _prefs;
+  static const _key = "vehicles";
+
+  VehiclesNotifier(this._prefs) : super(_load(_prefs));
+
+  static List<Vehicle> _load(SharedPreferences p) {
+    final raw = p.getString(_key);
+    if (raw == null) return const [Vehicle("Мой автомобиль", "")];
+    try {
+      final list = (jsonDecode(raw) as List)
+          .map((e) => Vehicle.fromJson(e as Map<String, dynamic>))
+          .toList();
+      return list;
+    } catch (_) {
+      return const [Vehicle("Мой автомобиль", "")];
+    }
+  }
+
+  void _persist() =>
+      _prefs.setString(_key, jsonEncode(state.map((v) => v.toJson()).toList()));
+
+  void add(Vehicle v) {
+    state = [...state, v];
+    _persist();
+  }
+
+  void removeAt(int i) {
+    state = [...state]..removeAt(i);
+    _persist();
+  }
 }
 
-final vehiclesProvider =
-    StateNotifierProvider<VehiclesNotifier, List<Vehicle>>((ref) => VehiclesNotifier());
+final vehiclesProvider = StateNotifierProvider<VehiclesNotifier, List<Vehicle>>(
+    (ref) => VehiclesNotifier(ref.watch(prefsProvider)));
 
 
 // ===== главное меню =====
@@ -2491,7 +2542,22 @@ class _DataLoggingScreenState extends ConsumerState<DataLoggingScreen> {
     return b.toString();
   }
 
-  void _showCsv() {
+  /// Сохраняет лог в файл во временной папке и открывает системный «Поделиться».
+  /// Если шаринг недоступен (например, на десктопе) — показывает CSV в диалоге.
+  Future<void> _export() async {
+    final csv = _csv();
+    try {
+      final dir = await getTemporaryDirectory();
+      final ts = DateTime.now().millisecondsSinceEpoch;
+      final file = File("${dir.path}/obd_log_$ts.csv");
+      await file.writeAsString(csv);
+      await Share.shareXFiles([XFile(file.path)], text: "Лог OBD ($ts)");
+    } catch (_) {
+      if (mounted) _showCsv(csv);
+    }
+  }
+
+  void _showCsv(String csv) {
     showDialog(
       context: context,
       builder: (_) => AlertDialog(
@@ -2501,7 +2567,7 @@ class _DataLoggingScreenState extends ConsumerState<DataLoggingScreen> {
         content: SizedBox(
           width: double.maxFinite,
           child: SingleChildScrollView(
-            child: SelectableText(_csv(),
+            child: SelectableText(csv,
                 style: const TextStyle(color: Colors.white70, fontFamily: "monospace", fontSize: 12)),
           ),
         ),
@@ -2551,7 +2617,7 @@ class _DataLoggingScreenState extends ConsumerState<DataLoggingScreen> {
                       ),
                       const SizedBox(width: 12),
                       OutlinedButton(
-                        onPressed: _rows.isEmpty ? null : _showCsv,
+                        onPressed: _rows.isEmpty ? null : _export,
                         child: const Text("Экспорт"),
                       ),
                       const SizedBox(width: 8),
@@ -2832,12 +2898,14 @@ class SettingsScreen extends ConsumerWidget {
           SegmentedButton<TransportKind>(
             segments: const [
               ButtonSegment(value: TransportKind.ble, label: Text("BLE")),
-              ButtonSegment(value: TransportKind.btClassic, label: Text("BT")),
               ButtonSegment(value: TransportKind.wifi, label: Text("Wi-Fi")),
             ],
             selected: {kind},
-            onSelectionChanged: (s) =>
-                ref.read(transportKindProvider.notifier).state = s.first,
+            onSelectionChanged: (s) {
+              final prefs = ref.read(prefsProvider);
+              ref.read(transportKindProvider.notifier).state = s.first;
+              prefs.setInt("transportKind", s.first.index);
+            },
           ),
           const SizedBox(height: 24),
           if (kind == TransportKind.wifi) ...[
@@ -2848,7 +2916,10 @@ class SettingsScreen extends ConsumerWidget {
               initialValue: host,
               style: const TextStyle(color: Colors.white),
               decoration: const InputDecoration(labelText: "Хост (IP)"),
-              onChanged: (v) => ref.read(wifiHostProvider.notifier).state = v.trim(),
+              onChanged: (v) {
+                ref.read(wifiHostProvider.notifier).state = v.trim();
+                ref.read(prefsProvider).setString("wifiHost", v.trim());
+              },
             ),
             TextFormField(
               initialValue: port.toString(),
@@ -2857,7 +2928,10 @@ class SettingsScreen extends ConsumerWidget {
               decoration: const InputDecoration(labelText: "Порт"),
               onChanged: (v) {
                 final p = int.tryParse(v.trim());
-                if (p != null) ref.read(wifiPortProvider.notifier).state = p;
+                if (p != null) {
+                  ref.read(wifiPortProvider.notifier).state = p;
+                  ref.read(prefsProvider).setInt("wifiPort", p);
+                }
               },
             ),
             const SizedBox(height: 24),
@@ -2870,8 +2944,10 @@ class SettingsScreen extends ConsumerWidget {
             max: 1000,
             divisions: 19,
             label: "$interval мс",
-            onChanged: (v) =>
-                ref.read(pollIntervalMsProvider.notifier).state = v.round(),
+            onChanged: (v) {
+              ref.read(pollIntervalMsProvider.notifier).state = v.round();
+              ref.read(prefsProvider).setInt("pollIntervalMs", v.round());
+            },
           ),
           const SizedBox(height: 8),
           const Text(
@@ -2887,8 +2963,15 @@ class SettingsScreen extends ConsumerWidget {
 
 // ===== из main.dart =====
 
-void main() {
-  runApp(const ProviderScope(child: ObdApp()));
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final prefs = await SharedPreferences.getInstance();
+  runApp(
+    ProviderScope(
+      overrides: [prefsProvider.overrideWithValue(prefs)],
+      child: const ObdApp(),
+    ),
+  );
 }
 
 class ObdApp extends StatelessWidget {
