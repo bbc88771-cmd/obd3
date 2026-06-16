@@ -5,6 +5,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -220,23 +221,30 @@ class ObdParsers {
   ///   биты 5-4 → первая цифра, биты 3-0 → вторая цифра
   ///   2-й байт → последние две шестнадцатеричные цифры
   /// Пример: байты 01 33 → P0133.
-  static List<String> dtc(String resp) {
-    if (_isGarbage(resp) || !resp.startsWith("43")) return [];
-    final hex = resp.substring(2); // отрезаем эхо режима "43"
+  static List<String> dtc(String resp) => dtcFrom(resp, "43");
+
+  /// Универсальный разбор кодов для режимов с эхом echo:
+  /// "43" — сохранённые (Mode 03), "47" — ожидающие (Mode 07),
+  /// "4A" — постоянные (Mode 0A).
+  static List<String> dtcFrom(String resp, String echo) {
+    if (_isGarbage(resp)) return [];
+    final idx = resp.indexOf(echo);
+    if (idx < 0) return [];
+    final hex = resp.substring(idx + echo.length);
     final codes = <String>[];
     const letters = ['P', 'C', 'B', 'U'];
 
     for (int i = 0; i + 4 <= hex.length; i += 4) {
       final chunk = hex.substring(i, i + 4);
       if (chunk == "0000") continue; // пустой слот
-
-      final first = int.parse(chunk.substring(0, 2), radix: 16);
+      final first = int.tryParse(chunk.substring(0, 2), radix: 16);
+      if (first == null) continue;
       final letter = letters[(first & 0xC0) >> 6];   // биты 7-6
       final d1 = (first & 0x30) >> 4;                // биты 5-4
       final d2 = first & 0x0F;                       // биты 3-0
       final rest = chunk.substring(2);               // байт B как есть
-
-      codes.add("$letter$d1${d2.toRadixString(16)}$rest".toUpperCase());
+      final code = "$letter$d1${d2.toRadixString(16)}$rest".toUpperCase();
+      if (!codes.contains(code)) codes.add(code);
     }
     return codes;
   }
@@ -359,6 +367,83 @@ class MonitorStatus {
   final bool supported;
   final bool complete; // true = тест завершён (готов)
   const MonitorStatus(this.name, this.supported, this.complete);
+}
+
+/// Расшифрованный код ошибки.
+class DtcInfo {
+  final String code;
+  final String system;      // подсистема (Двигатель/Шасси/Кузов/Сеть)
+  final bool generic;       // true = общий стандарт SAE, false = код производителя
+  final String description; // человекочитаемое описание
+  const DtcInfo({
+    required this.code,
+    required this.system,
+    required this.generic,
+    required this.description,
+  });
+}
+
+/// Небольшой встроенный справочник распространённых кодов + структурный разбор.
+class DtcCatalog {
+  static const _db = <String, String>{
+    "P0100": "Неисправность цепи расходомера воздуха (MAF)",
+    "P0101": "MAF: показания вне диапазона",
+    "P0102": "MAF: низкий сигнал",
+    "P0113": "Датчик температуры впуска (IAT): высокий сигнал",
+    "P0117": "Датчик температуры ОЖ: низкий сигнал",
+    "P0118": "Датчик температуры ОЖ: высокий сигнал",
+    "P0120": "Неисправность цепи датчика положения дросселя (TPS)",
+    "P0128": "Термостат: ОЖ не достигает рабочей температуры",
+    "P0130": "Датчик кислорода (Bank 1, Sensor 1): цепь",
+    "P0131": "Датчик кислорода (B1S1): низкое напряжение",
+    "P0133": "Медленный отклик датчика кислорода (B1S1)",
+    "P0134": "Нет активности датчика кислорода (B1S1)",
+    "P0135": "Подогрев датчика кислорода (B1S1): цепь",
+    "P0171": "Слишком бедная смесь (Bank 1)",
+    "P0172": "Слишком богатая смесь (Bank 1)",
+    "P0174": "Слишком бедная смесь (Bank 2)",
+    "P0300": "Случайные/множественные пропуски зажигания",
+    "P0301": "Пропуски зажигания в цилиндре 1",
+    "P0302": "Пропуски зажигания в цилиндре 2",
+    "P0303": "Пропуски зажигания в цилиндре 3",
+    "P0304": "Пропуски зажигания в цилиндре 4",
+    "P0325": "Датчик детонации: цепь (Bank 1)",
+    "P0335": "Датчик положения коленвала (CKP): цепь",
+    "P0340": "Датчик положения распредвала (CMP): цепь",
+    "P0401": "Недостаточный поток рециркуляции ОГ (EGR)",
+    "P0420": "Эффективность катализатора ниже порога (Bank 1)",
+    "P0430": "Эффективность катализатора ниже порога (Bank 2)",
+    "P0440": "Система улавливания паров топлива (EVAP): утечка",
+    "P0442": "EVAP: малая утечка",
+    "P0455": "EVAP: большая утечка",
+    "P0500": "Датчик скорости автомобиля (VSS): неисправность",
+    "P0506": "Обороты холостого хода ниже нормы",
+    "P0507": "Обороты холостого хода выше нормы",
+    "P0600": "Ошибка шины обмена ЭБУ",
+    "P0700": "Неисправность системы управления АКПП",
+    "U0100": "Потеря связи с ЭБУ двигателя (ECM/PCM)",
+    "U0121": "Потеря связи с блоком ABS",
+    "C0035": "Датчик скорости левого переднего колеса",
+    "B0010": "Подушка безопасности: цепь",
+  };
+
+  static DtcInfo describe(String raw) {
+    final code = raw.toUpperCase().trim();
+    String system;
+    switch (code.isEmpty ? 'P' : code[0]) {
+      case 'C': system = "Шасси (ABS, подвеска)"; break;
+      case 'B': system = "Кузов (комфорт, SRS)"; break;
+      case 'U': system = "Сеть и обмен данными"; break;
+      default: system = "Двигатель и трансмиссия";
+    }
+    // Вторая цифра: 0 — общий стандарт SAE, 1 — код производителя.
+    final generic = code.length > 1 && (code[1] == '0' || code[1] == '2');
+    final desc = _db[code] ??
+        (generic
+            ? "Стандартный код $system. Описание не в базе — уточните по справочнику."
+            : "Код производителя — описание зависит от марки авто.");
+    return DtcInfo(code: code, system: system, generic: generic, description: desc);
+  }
 }
 
 /// Каталог PID для удобного опроса.
@@ -821,6 +906,18 @@ class ObdService {
     return ObdParsers.dtc(resp);
   }
 
+  /// Ожидающие коды (Mode 07) — ещё не подтверждённые ЭБУ.
+  Future<List<String>> readPendingDtc() async {
+    final resp = await _queue.enqueue("07", timeout: const Duration(seconds: 3));
+    return ObdParsers.dtcFrom(resp, "47");
+  }
+
+  /// Постоянные коды (Mode 0A) — нельзя стереть сканером, гаснут сами.
+  Future<List<String>> readPermanentDtc() async {
+    final resp = await _queue.enqueue("0A", timeout: const Duration(seconds: 3));
+    return ObdParsers.dtcFrom(resp, "4A");
+  }
+
   /// БЕЗОПАСНОСТЬ: проверка, что машина неподвижна перед записью.
   Future<bool> _isSafeToWrite() async {
     try {
@@ -1159,8 +1256,12 @@ class FakeTransport implements ObdTransport {
     // Готовность мониторов: лампа выключена, ошибок нет, тесты пройдены.
     if (cmd == "0101") return "410100072100";
 
-    // Коды ошибок (демо): P0133, P0420.
+    // Коды ошибок (демо): сохранённые P0133, P0420.
     if (cmd == "03") return "4301330420";
+    // Ожидающие (Mode 07): P0301.
+    if (cmd == "07") return "470301";
+    // Постоянные (Mode 0A): P0420.
+    if (cmd == "0A") return "4A0420";
     if (cmd == "04") return "44"; // сброс выполнен
 
     // VIN и имя ЭБУ.
@@ -1387,9 +1488,25 @@ final telemetryProvider = StreamProvider<Telemetry>((ref) {
 });
 
 
-// ===== из gauge_widget.dart =====
+// ===== палитра и тема приложения =====
 
-/// Аналоговый круговой прибор (стрелка), как в Torque.
+/// Единая палитра. Намеренно уходим от «синего» стиля типовых OBD-приложений:
+/// тёмный графит + энергичный оранжевый акцент и бирюзовый второстепенный.
+class AppColors {
+  static const bg = Color(0xFF0C100F);
+  static const surface = Color(0xFF171D1C);
+  static const surface2 = Color(0xFF212927);
+  static const accent = Color(0xFFFF6A2C); // оранжевый
+  static const accent2 = Color(0xFF2DD4BF); // бирюзовый
+  static const ok = Color(0xFF34D399);
+  static const warn = Color(0xFFF5A524);
+  static const err = Color(0xFFFF5A5F);
+  static const text = Color(0xFFF2F4F3);
+  static const textDim = Color(0xFF8A938F);
+}
+
+/// Скруглённый прогресс-прибор в новом стиле: толстая дуга со скруглением,
+/// крупное число в центре, акцентный «бегунок» вместо классической стрелки.
 class GaugeWidget extends StatelessWidget {
   final String label;
   final String unit;
@@ -1403,7 +1520,7 @@ class GaugeWidget extends StatelessWidget {
     required this.unit,
     required this.value,
     required this.maxValue,
-    this.color = Colors.cyanAccent,
+    this.color = AppColors.accent,
   });
 
   @override
@@ -1416,17 +1533,22 @@ class GaugeWidget extends StatelessWidget {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const SizedBox(height: 36),
+              const SizedBox(height: 30),
               Text(value.toStringAsFixed(0),
+                  style: const TextStyle(
+                      color: AppColors.text,
+                      fontSize: 32,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: -1)),
+              Text(unit,
+                  style: const TextStyle(color: AppColors.textDim, fontSize: 12)),
+              const SizedBox(height: 2),
+              Text(label.toUpperCase(),
                   style: TextStyle(
                       color: color,
-                      fontSize: 30,
-                      fontWeight: FontWeight.bold)),
-              Text(unit,
-                  style: const TextStyle(color: Colors.white54, fontSize: 12)),
-              const SizedBox(height: 4),
-              Text(label,
-                  style: const TextStyle(color: Colors.white70, fontSize: 13)),
+                      fontSize: 11,
+                      letterSpacing: 1.2,
+                      fontWeight: FontWeight.w600)),
             ],
           ),
         ),
@@ -1441,45 +1563,41 @@ class _GaugePainter extends CustomPainter {
   final Color color;
   _GaugePainter(this.value, this.maxValue, this.color);
 
-  // дуга от 135° до 405° (270° полного хода)
-  static const _start = 135 * pi / 180;
-  static const _sweep = 270 * pi / 180;
+  // дуга-«подкова» снизу: от 130° на 280°
+  static const _start = 130 * pi / 180;
+  static const _sweep = 280 * pi / 180;
 
   @override
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
-    final radius = size.width / 2 - 10;
+    final radius = size.width / 2 - 12;
     final rect = Rect.fromCircle(center: center, radius: radius);
 
-    // фон дуги
     final bg = Paint()
-      ..color = Colors.white12
+      ..color = AppColors.surface2
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 10
+      ..strokeWidth = 13
       ..strokeCap = StrokeCap.round;
     canvas.drawArc(rect, _start, _sweep, false, bg);
 
-    // заполненная часть
-    final fillAngle = _sweep * (value / maxValue);
+    final fillAngle = _sweep * (value / maxValue).clamp(0, 1);
     final fg = Paint()
-      ..color = color
+      ..shader = SweepGradient(
+        startAngle: _start,
+        endAngle: _start + _sweep,
+        colors: [color.withOpacity(0.55), color],
+        transform: GradientRotation(_start),
+      ).createShader(rect)
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 10
+      ..strokeWidth = 13
       ..strokeCap = StrokeCap.round;
     canvas.drawArc(rect, _start, fillAngle, false, fg);
 
-    // стрелка
-    final needleAngle = _start + fillAngle;
-    final needleEnd = Offset(
-      center.dx + (radius - 18) * cos(needleAngle),
-      center.dy + (radius - 18) * sin(needleAngle),
-    );
-    final needle = Paint()
-      ..color = Colors.redAccent
-      ..strokeWidth = 3
-      ..strokeCap = StrokeCap.round;
-    canvas.drawLine(center, needleEnd, needle);
-    canvas.drawCircle(center, 5, Paint()..color = Colors.redAccent);
+    // бегунок на конце заполнения
+    final a = _start + fillAngle;
+    final knob = Offset(center.dx + radius * cos(a), center.dy + radius * sin(a));
+    canvas.drawCircle(knob, 9, Paint()..color = color);
+    canvas.drawCircle(knob, 4, Paint()..color = AppColors.bg);
   }
 
   @override
@@ -1487,38 +1605,420 @@ class _GaugePainter extends CustomPainter {
 }
 
 
-// ===== из dashboard_screen.dart =====
+// ===== общие UI-компоненты новой темы =====
 
-class DashboardScreen extends ConsumerWidget {
-  const DashboardScreen({super.key});
+/// Декорация «панели»: тёмная поверхность со скруглением и тонкой обводкой.
+BoxDecoration panelDecoration({Color? border}) => BoxDecoration(
+      color: AppColors.surface,
+      borderRadius: BorderRadius.circular(20),
+      border: Border.all(color: border ?? Colors.white.withOpacity(0.06)),
+    );
+
+/// Заголовок-секция с цветной чертой слева.
+class SectionTitle extends StatelessWidget {
+  final String text;
+  const SectionTitle(this.text, {super.key});
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.fromLTRB(4, 8, 4, 10),
+        child: Row(children: [
+          Container(width: 4, height: 16, decoration: BoxDecoration(
+              color: AppColors.accent, borderRadius: BorderRadius.circular(2))),
+          const SizedBox(width: 8),
+          Text(text.toUpperCase(),
+              style: const TextStyle(
+                  color: AppColors.textDim,
+                  fontSize: 12,
+                  letterSpacing: 1.5,
+                  fontWeight: FontWeight.w700)),
+        ]),
+      );
+}
+
+/// Маленький индикатор-«пилюля» статуса линка для AppBar.
+class _StatusChip extends StatelessWidget {
+  final LinkState link;
+  const _StatusChip(this.link);
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final conn = ref.watch(connectionProvider);
-
-    return Scaffold(
-      backgroundColor: const Color(0xFF0E1116),
-      appBar: AppBar(
-        backgroundColor: const Color(0xFF161B22),
-        title: const Text("Панель приборов"),
-        actions: [_StatusChip(conn.link)],
+  Widget build(BuildContext context) {
+    final map = {
+      LinkState.disconnected: ("офлайн", AppColors.textDim),
+      LinkState.scanning: ("поиск", AppColors.warn),
+      LinkState.connecting: ("связь", AppColors.warn),
+      LinkState.initializing: ("init", AppColors.warn),
+      LinkState.connected: ("онлайн", AppColors.ok),
+      LinkState.error: ("ошибка", AppColors.err),
+    };
+    final (text, color) = map[link]!;
+    return Container(
+      margin: const EdgeInsets.only(right: 14),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.14),
+        borderRadius: BorderRadius.circular(20),
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: conn.isConnected
-            ? Column(
-                children: const [
-                  Expanded(child: _GaugesGrid()),
-                  _DtcPanel(),
-                ],
-              )
-            : const _NotConnected(),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Container(width: 7, height: 7, decoration: BoxDecoration(
+            color: color, shape: BoxShape.circle)),
+        const SizedBox(width: 6),
+        Text(text, style: TextStyle(
+            color: color, fontSize: 12, fontWeight: FontWeight.w600)),
+      ]),
+    );
+  }
+}
+
+/// Заглушка для экранов, которым нужно активное соединение.
+class _NotConnected extends StatelessWidget {
+  final String? hint;
+  const _NotConnected({this.hint});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(22),
+            decoration: BoxDecoration(
+                color: AppColors.surface, shape: BoxShape.circle),
+            child: const Icon(Icons.power_off_rounded,
+                color: AppColors.textDim, size: 44),
+          ),
+          const SizedBox(height: 16),
+          const Text("Адаптер не подключён",
+              style: TextStyle(
+                  color: AppColors.text,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w600)),
+          const SizedBox(height: 6),
+          Text(hint ?? "Откройте вкладку «Гараж» и нажмите\n«Подключить» или «Демо-режим».",
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: AppColors.textDim, fontSize: 13)),
+        ],
       ),
     );
   }
 }
 
-/// Экран «Показатели» — только круговые приборы во весь экран.
+/// Большая карточка подключения — «сердце» вкладки «Гараж».
+class ConnectCard extends ConsumerWidget {
+  const ConnectCard({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final conn = ref.watch(connectionProvider);
+    final elmOk = conn.link == LinkState.initializing || conn.isConnected;
+    final ecuOk = conn.isConnected;
+
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(24),
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: conn.isConnected
+              ? [AppColors.accent2.withOpacity(0.22), AppColors.surface]
+              : [AppColors.surface2, AppColors.surface],
+        ),
+        border: Border.all(color: Colors.white.withOpacity(0.06)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(children: [
+            Icon(conn.isConnected ? Icons.bolt : Icons.bluetooth_searching,
+                color: conn.isConnected ? AppColors.accent2 : AppColors.accent, size: 26),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                conn.isBusy
+                    ? "Устанавливаем связь…"
+                    : conn.isConnected
+                        ? (conn.demo ? "Демо-режим активен" : "Связь с автомобилем")
+                        : "Готов к подключению",
+                style: const TextStyle(
+                    color: AppColors.text, fontSize: 17, fontWeight: FontWeight.w700),
+              ),
+            ),
+          ]),
+          const SizedBox(height: 14),
+          Row(children: [
+            _LinkDot(label: "ELM327", ok: elmOk),
+            const SizedBox(width: 10),
+            _LinkDot(label: "ЭБУ", ok: ecuOk),
+          ]),
+          if (conn.error != null) ...[
+            const SizedBox(height: 10),
+            Text(conn.error!,
+                style: const TextStyle(color: AppColors.err, fontSize: 12)),
+          ],
+          const SizedBox(height: 16),
+          Row(children: [
+            Expanded(
+              flex: 2,
+              child: FilledButton(
+                style: FilledButton.styleFrom(
+                  backgroundColor:
+                      conn.isConnected ? AppColors.err : AppColors.accent,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14)),
+                ),
+                onPressed: conn.isBusy
+                    ? null
+                    : () {
+                        final ctrl = ref.read(connectionProvider.notifier);
+                        if (conn.isConnected) {
+                          ctrl.disconnect();
+                        } else {
+                          ctrl.connect(
+                            ref.read(transportKindProvider),
+                            wifiHost: ref.read(wifiHostProvider),
+                            wifiPort: ref.read(wifiPortProvider),
+                            interval: Duration(
+                                milliseconds: ref.read(pollIntervalMsProvider)),
+                          );
+                        }
+                      },
+                child: Text(conn.isBusy
+                    ? "Подключение…"
+                    : conn.isConnected
+                        ? "Отключить"
+                        : "Подключить"),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: OutlinedButton(
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: AppColors.accent2,
+                  side: const BorderSide(color: AppColors.accent2),
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14)),
+                ),
+                onPressed: conn.isBusy || conn.isConnected
+                    ? null
+                    : () => ref.read(connectionProvider.notifier).connectDemo(
+                          interval: Duration(
+                              milliseconds: ref.read(pollIntervalMsProvider)),
+                        ),
+                child: const Text("Демо"),
+              ),
+            ),
+          ]),
+        ],
+      ),
+    );
+  }
+}
+
+class _LinkDot extends StatelessWidget {
+  final String label;
+  final bool ok;
+  const _LinkDot({required this.label, required this.ok});
+  @override
+  Widget build(BuildContext context) {
+    final c = ok ? AppColors.ok : AppColors.textDim;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+      decoration: BoxDecoration(
+          color: AppColors.bg.withOpacity(0.4),
+          borderRadius: BorderRadius.circular(10)),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Icon(ok ? Icons.check_circle : Icons.remove_circle_outline,
+            color: c, size: 15),
+        const SizedBox(width: 6),
+        Text(label, style: TextStyle(color: c, fontSize: 12, fontWeight: FontWeight.w600)),
+      ]),
+    );
+  }
+}
+
+/// Карточка одного живого параметра с мини-полосой заполнения.
+class MetricCard extends StatelessWidget {
+  final String label;
+  final String value;
+  final String unit;
+  final double fraction; // 0..1 для мини-бара
+  final Color color;
+  final IconData icon;
+  const MetricCard({
+    super.key,
+    required this.label,
+    required this.value,
+    required this.unit,
+    required this.fraction,
+    required this.color,
+    required this.icon,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: panelDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Icon(icon, color: color, size: 18),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(label.toUpperCase(),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                      color: AppColors.textDim,
+                      fontSize: 10.5,
+                      letterSpacing: 1,
+                      fontWeight: FontWeight.w600)),
+            ),
+          ]),
+          const SizedBox(height: 10),
+          Row(crossAxisAlignment: CrossAxisAlignment.baseline,
+              textBaseline: TextBaseline.alphabetic, children: [
+            Text(value,
+                style: const TextStyle(
+                    color: AppColors.text,
+                    fontSize: 26,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: -0.5)),
+            const SizedBox(width: 4),
+            Text(unit, style: const TextStyle(color: AppColors.textDim, fontSize: 12)),
+          ]),
+          const SizedBox(height: 10),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: fraction.clamp(0, 1),
+              minHeight: 5,
+              backgroundColor: AppColors.surface2,
+              valueColor: AlwaysStoppedAnimation(color),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Строка-«плитка» хаба (Диагностика / Ещё) — список вместо сетки иконок.
+class HubTile extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final Color color;
+  final VoidCallback onTap;
+  const HubTile({
+    super.key,
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.color,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(16),
+          onTap: onTap,
+          child: Container(
+            padding: const EdgeInsets.all(14),
+            decoration: panelDecoration(),
+            child: Row(children: [
+              Container(
+                width: 42, height: 42,
+                decoration: BoxDecoration(
+                    color: color.withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(12)),
+                child: Icon(icon, color: color, size: 22),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(title, style: const TextStyle(
+                        color: AppColors.text, fontSize: 15, fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 2),
+                    Text(subtitle, style: const TextStyle(
+                        color: AppColors.textDim, fontSize: 12)),
+                  ],
+                ),
+              ),
+              const Icon(Icons.chevron_right, color: AppColors.textDim),
+            ]),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
+// ===== вкладки и экраны =====
+
+/// Вкладка «Гараж»: подключение + ключевые живые показатели + сводка ошибок.
+class _DashboardTab extends ConsumerWidget {
+  const _DashboardTab();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final conn = ref.watch(connectionProvider);
+    final tele = ref.watch(telemetryProvider);
+    final t = tele.asData?.value ?? const Telemetry();
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+      children: [
+        const ConnectCard(),
+        const SizedBox(height: 16),
+        if (conn.isConnected) ...[
+          const SectionTitle("Ключевые показатели"),
+          GridView.count(
+            crossAxisCount: 2,
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            mainAxisSpacing: 12,
+            crossAxisSpacing: 12,
+            childAspectRatio: 1.45,
+            children: [
+              MetricCard(label: "Скорость", value: "${t.speed ?? 0}", unit: "км/ч",
+                  fraction: (t.speed ?? 0) / 240, color: AppColors.accent2, icon: Icons.speed),
+              MetricCard(label: "Обороты", value: "${t.rpm ?? 0}", unit: "об/мин",
+                  fraction: (t.rpm ?? 0) / 8000, color: AppColors.accent, icon: Icons.autorenew),
+              MetricCard(label: "Темп. ОЖ", value: "${t.coolant ?? 0}", unit: "°C",
+                  fraction: (t.coolant ?? 0) / 130, color: AppColors.warn, icon: Icons.thermostat),
+              MetricCard(label: "Напряжение", value: (t.voltage ?? 0).toStringAsFixed(1), unit: "В",
+                  fraction: (t.voltage ?? 0) / 15, color: AppColors.ok, icon: Icons.battery_charging_full),
+            ],
+          ),
+          const SizedBox(height: 8),
+          const SectionTitle("Диагностика"),
+          const _DtcPanel(),
+        ] else
+          Padding(
+            padding: const EdgeInsets.only(top: 40),
+            child: _NotConnected(
+                hint: "Нажмите «Подключить» для связи с адаптером\nили «Демо» для просмотра без авто."),
+          ),
+      ],
+    );
+  }
+}
+
+/// Экран «Показатели» — круговые приборы во весь экран (открывается из «Ещё»).
 class GaugesScreen extends ConsumerWidget {
   const GaugesScreen({super.key});
 
@@ -1526,39 +2026,15 @@ class GaugesScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final conn = ref.watch(connectionProvider);
     return Scaffold(
-      backgroundColor: const Color(0xFF0E1116),
+      backgroundColor: const Color(0xFF0C100F),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF161B22),
+        backgroundColor: const Color(0xFF171D1C),
         title: const Text("Показатели"),
         actions: [_StatusChip(conn.link)],
       ),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: conn.isConnected ? const _GaugesGrid() : const _NotConnected(),
-      ),
-    );
-  }
-}
-
-/// Заглушка для экранов, которым нужно активное соединение.
-class _NotConnected extends StatelessWidget {
-  const _NotConnected();
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: const [
-          Icon(Icons.usb_off, color: Colors.white24, size: 56),
-          SizedBox(height: 12),
-          Text("Нет соединения с адаптером",
-              style: TextStyle(color: Colors.white54, fontSize: 16)),
-          SizedBox(height: 4),
-          Text("Вернитесь на главный экран и нажмите\n«Подключить» или «Демо».",
-              textAlign: TextAlign.center,
-              style: TextStyle(color: Colors.white38, fontSize: 13)),
-        ],
       ),
     );
   }
@@ -1582,49 +2058,49 @@ class _GaugesGrid extends ConsumerWidget {
               unit: "об/мин",
               value: (t.rpm ?? 0).toDouble(),
               maxValue: 8000,
-              color: Colors.cyanAccent),
+              color: AppColors.accent),
           GaugeWidget(
               label: "Скорость",
               unit: "км/ч",
               value: (t.speed ?? 0).toDouble(),
               maxValue: 240,
-              color: Colors.greenAccent),
+              color: AppColors.accent2),
           GaugeWidget(
               label: "Темп. ОЖ",
               unit: "°C",
               value: (t.coolant ?? 0).toDouble(),
               maxValue: 130,
-              color: Colors.orangeAccent),
+              color: AppColors.warn),
           GaugeWidget(
               label: "Нагрузка",
               unit: "%",
               value: t.load ?? 0,
               maxValue: 100,
-              color: Colors.purpleAccent),
+              color: AppColors.ok),
           GaugeWidget(
               label: "Наддув (MAP)",
               unit: "кПа",
               value: (t.map ?? 0).toDouble(),
               maxValue: 250,
-              color: Colors.tealAccent),
+              color: AppColors.accent2),
           GaugeWidget(
               label: "Топливо",
               unit: "%",
               value: t.fuelLevel ?? 0,
               maxValue: 100,
-              color: Colors.amberAccent),
+              color: AppColors.warn),
           GaugeWidget(
               label: "Расход",
               unit: "л/ч",
               value: t.fuelRate ?? 0,
               maxValue: 30,
-              color: Colors.lightBlueAccent),
+              color: AppColors.accent),
           GaugeWidget(
               label: "Темп. впуска",
               unit: "°C",
               value: (t.intakeTemp ?? 0).toDouble(),
               maxValue: 90,
-              color: Colors.pinkAccent),
+              color: AppColors.ok),
         ],
       ),
       loading: () => const Center(child: CircularProgressIndicator()),
@@ -1636,141 +2112,53 @@ class _GaugesGrid extends ConsumerWidget {
   }
 }
 
-class _DtcPanel extends ConsumerStatefulWidget {
+/// Компактная карточка на дашборде — открывает полный экран «Ошибки (DTC)».
+class _DtcPanel extends StatelessWidget {
   const _DtcPanel();
-  @override
-  ConsumerState<_DtcPanel> createState() => _DtcPanelState();
-}
-
-class _DtcPanelState extends ConsumerState<_DtcPanel> {
-  List<String> _codes = [];
-  bool _loading = false;
-
-  Future<void> _read() async {
-    final svc = ref.read(connectionProvider.notifier).service;
-    if (svc == null) return;
-    setState(() => _loading = true);
-    try {
-      final codes = await svc.readDtc();
-      setState(() => _codes = codes);
-    } finally {
-      setState(() => _loading = false);
-    }
-  }
-
-  Future<void> _clear() async {
-    final svc = ref.read(connectionProvider.notifier).service;
-    if (svc == null) return;
-
-    // ОБЯЗАТЕЛЬНОЕ подтверждение перед записью в шину
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: const Text("Сбросить ошибки?"),
-        content: const Text(
-            "Check Engine погаснет, freeze frame будет стёрт. "
-            "Автомобиль должен стоять (V=0). Продолжить?"),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text("Отмена")),
-          FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text("Сбросить")),
-        ],
-      ),
-    );
-    if (ok != true) return;
-
-    try {
-      await svc.clearDtc(userConfirmed: true);
-      setState(() => _codes = []);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text("Ошибки сброшены")));
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("$e"), backgroundColor: Colors.red));
-      }
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
-    final connected =
-        ref.watch(connectionProvider).link == LinkState.connected;
-
-    return Card(
-      color: const Color(0xFF161B22),
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                const Text("Ошибки (DTC)",
-                    style: TextStyle(color: Colors.white, fontSize: 16)),
-                const Spacer(),
-                TextButton(
-                    onPressed: connected && !_loading ? _read : null,
-                    child: const Text("Прочитать")),
-                TextButton(
-                    onPressed: connected && _codes.isNotEmpty ? _clear : null,
-                    child: const Text("Сбросить",
-                        style: TextStyle(color: Colors.redAccent))),
-              ],
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(20),
+        onTap: () => Navigator.of(context)
+            .push(MaterialPageRoute(builder: (_) => const DtcScreen())),
+        child: Container(
+          padding: const EdgeInsets.all(16),
+          decoration: panelDecoration(),
+          child: Row(children: [
+            Container(
+              width: 44,
+              height: 44,
+              decoration: BoxDecoration(
+                  color: AppColors.err.withOpacity(0.15),
+                  borderRadius: BorderRadius.circular(12)),
+              child: const Icon(Icons.error_outline, color: AppColors.err, size: 22),
             ),
-            if (_loading) const LinearProgressIndicator(),
-            if (_codes.isEmpty && !_loading)
-              const Text("Кодов нет",
-                  style: TextStyle(color: Colors.white38))
-            else
-              Wrap(
-                spacing: 8,
-                children: _codes
-                    .map((c) => Chip(
-                          label: Text(c),
-                          backgroundColor: Colors.red.shade900,
-                          labelStyle: const TextStyle(color: Colors.white),
-                        ))
-                    .toList(),
+            const SizedBox(width: 14),
+            const Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text("Коды ошибок (DTC)",
+                      style: TextStyle(
+                          color: AppColors.text,
+                          fontSize: 15,
+                          fontWeight: FontWeight.w600)),
+                  SizedBox(height: 2),
+                  Text("Сохранённые, ожидающие и постоянные + расшифровка",
+                      style: TextStyle(color: AppColors.textDim, fontSize: 12)),
+                ],
               ),
-          ],
+            ),
+            const Icon(Icons.chevron_right, color: AppColors.textDim),
+          ]),
         ),
       ),
     );
   }
 }
-
-class _StatusChip extends StatelessWidget {
-  final LinkState link;
-  const _StatusChip(this.link);
-
-  @override
-  Widget build(BuildContext context) {
-    final map = {
-      LinkState.disconnected: ("Отключено", Colors.grey),
-      LinkState.scanning: ("Поиск…", Colors.amber),
-      LinkState.connecting: ("Подключение…", Colors.amber),
-      LinkState.initializing: ("Инициализация…", Colors.amber),
-      LinkState.connected: ("Онлайн", Colors.green),
-      LinkState.error: ("Ошибка", Colors.red),
-    };
-    final (text, color) = map[link]!;
-    return Padding(
-      padding: const EdgeInsets.only(right: 12),
-      child: Chip(
-        label: Text(text, style: const TextStyle(fontSize: 12)),
-        backgroundColor: color.withOpacity(0.2),
-        side: BorderSide(color: color),
-      ),
-    );
-  }
-}
-
 
 // ===== модель «Мои автомобили» =====
 
@@ -1822,207 +2210,191 @@ final vehiclesProvider = StateNotifierProvider<VehiclesNotifier, List<Vehicle>>(
     (ref) => VehiclesNotifier(ref.watch(prefsProvider)));
 
 
-// ===== главное меню =====
+// ===== корневая оболочка с нижней навигацией =====
 
-/// Описание плитки главного меню.
-class _Feature {
-  final IconData icon;
-  final String label;
-  final Widget Function() builder;
-  final bool needsConnection;
-  const _Feature(this.icon, this.label, this.builder, {this.needsConnection = true});
-}
-
-class HomeMenuScreen extends ConsumerWidget {
-  const HomeMenuScreen({super.key});
-
-  static final _features = <_Feature>[
-    _Feature(Icons.speed, "Панель приборов", () => const DashboardScreen()),
-    _Feature(Icons.show_chart, "Показатели", () => const GaugesScreen()),
-    _Feature(Icons.sensors, "Все датчики", () => const SensorListScreen(title: "Все датчики")),
-    _Feature(Icons.error_outline, "Ошибки (DTC)", () => const DtcScreen()),
-    _Feature(Icons.ac_unit, "Стоп-кадр", () => const FreezeFrameScreen()),
-    _Feature(Icons.memory, "Мониторинг ЭБУ", () => const SensorListScreen(title: "Мониторинг ЭБУ")),
-    _Feature(Icons.directions_car, "Мои автомобили", () => const MyCarsScreen(), needsConnection: false),
-    _Feature(Icons.settings, "Настройки", () => const SettingsScreen(), needsConnection: false),
-    _Feature(Icons.bar_chart, "Статистика", () => const StatisticsScreen()),
-    _Feature(Icons.badge, "Идентификаторы ЭБУ", () => const EcuIdScreen()),
-    _Feature(Icons.save_alt, "Запись данных", () => const DataLoggingScreen()),
-    _Feature(Icons.timer, "Замер разгона", () => const AccelerationScreen()),
-    _Feature(Icons.eco, "Тесты на выбросы", () => const EmissionsScreen()),
-  ];
-
+class RootShell extends ConsumerStatefulWidget {
+  const RootShell({super.key});
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final conn = ref.watch(connectionProvider);
-
-    return Scaffold(
-      backgroundColor: Colors.black,
-      appBar: AppBar(
-        backgroundColor: const Color(0xFF1565C0),
-        centerTitle: true,
-        title: const Text("Car Scanner",
-            style: TextStyle(fontWeight: FontWeight.bold)),
-      ),
-      body: Column(
-        children: [
-          Expanded(
-            child: GridView.count(
-              crossAxisCount: 3,
-              padding: const EdgeInsets.all(8),
-              children: _features.map((f) {
-                return _MenuTile(
-                  feature: f,
-                  enabled: !f.needsConnection || conn.isConnected,
-                  onTap: () {
-                    if (f.needsConnection && !conn.isConnected) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                            content: Text(
-                                "Сначала подключитесь к адаптеру или включите «Демо».")),
-                      );
-                      return;
-                    }
-                    Navigator.of(context).push(
-                      MaterialPageRoute(builder: (_) => f.builder()),
-                    );
-                  },
-                );
-              }).toList(),
-            ),
-          ),
-          const _HomeConnectBar(),
-        ],
-      ),
-    );
-  }
+  ConsumerState<RootShell> createState() => _RootShellState();
 }
 
-class _MenuTile extends StatelessWidget {
-  final _Feature feature;
-  final bool enabled;
-  final VoidCallback onTap;
-  const _MenuTile({
-    required this.feature,
-    required this.enabled,
-    required this.onTap,
-  });
+class _RootShellState extends ConsumerState<RootShell> {
+  int _index = 0;
+
+  static const _titles = ["Гараж", "Датчики", "Диагностика", "Ещё"];
 
   @override
   Widget build(BuildContext context) {
-    final color = enabled ? const Color(0xFF2196F3) : Colors.white24;
-    return InkWell(
-      onTap: onTap,
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(feature.icon, color: color, size: 40),
-          const SizedBox(height: 8),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 4),
-            child: Text(
-              feature.label,
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                color: enabled ? Colors.white : Colors.white38,
-                fontSize: 12,
-              ),
-            ),
-          ),
+    final conn = ref.watch(connectionProvider);
+
+    return Scaffold(
+      backgroundColor: AppColors.bg,
+      appBar: AppBar(
+        backgroundColor: AppColors.bg,
+        elevation: 0,
+        titleSpacing: 20,
+        title: Row(children: [
+          Text(_index == 0 ? "Revoscan" : _titles[_index],
+              style: const TextStyle(
+                  fontWeight: FontWeight.w800, fontSize: 20, letterSpacing: -0.5)),
+        ]),
+        actions: [_StatusChip(conn.link)],
+      ),
+      body: IndexedStack(
+        index: _index,
+        children: const [
+          _DashboardTab(),
+          _SensorsTab(),
+          _DiagnosticsTab(),
+          _MoreTab(),
+        ],
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _index,
+        onDestinationSelected: (i) => setState(() => _index = i),
+        backgroundColor: AppColors.surface,
+        indicatorColor: AppColors.accent.withOpacity(0.22),
+        destinations: const [
+          NavigationDestination(
+              icon: Icon(Icons.garage_outlined),
+              selectedIcon: Icon(Icons.garage, color: AppColors.accent),
+              label: "Гараж"),
+          NavigationDestination(
+              icon: Icon(Icons.sensors_outlined),
+              selectedIcon: Icon(Icons.sensors, color: AppColors.accent),
+              label: "Датчики"),
+          NavigationDestination(
+              icon: Icon(Icons.troubleshoot_outlined),
+              selectedIcon: Icon(Icons.troubleshoot, color: AppColors.accent),
+              label: "Диагностика"),
+          NavigationDestination(
+              icon: Icon(Icons.apps_outlined),
+              selectedIcon: Icon(Icons.apps, color: AppColors.accent),
+              label: "Ещё"),
         ],
       ),
     );
   }
 }
 
-/// Нижняя панель: статус линка/ЭБУ и кнопки «Подключить» / «Демо».
-class _HomeConnectBar extends ConsumerWidget {
-  const _HomeConnectBar();
+/// Вкладка «Датчики» — компактный живой список всех параметров.
+class _SensorsTab extends ConsumerWidget {
+  const _SensorsTab();
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final conn = ref.watch(connectionProvider);
+    final tele = ref.watch(telemetryProvider);
+    if (!conn.isConnected) return const _NotConnected();
+    final t = tele.asData?.value ?? const Telemetry();
+    final rows = _sensorRows(t);
 
-    // «Подключение к ELM» = есть физический линк (initializing и далее),
-    // «Подключение к ЭБУ» = протокол выбран и идёт опрос (connected).
-    final elmOk = conn.link == LinkState.initializing || conn.isConnected;
-    final ecuOk = conn.isConnected;
-
-    String statusText(bool ok) => ok ? "Подключено" : "Отключено";
-    Color statusColor(bool ok) => ok ? Colors.greenAccent : Colors.redAccent;
-
-    return Container(
-      color: const Color(0xFF111418),
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          _statusRow("Подключение к ELM:", statusText(elmOk), statusColor(elmOk)),
-          const SizedBox(height: 4),
-          _statusRow("Подключение к ЭБУ:", statusText(ecuOk), statusColor(ecuOk)),
-          if (conn.error != null) ...[
-            const SizedBox(height: 6),
-            Text(conn.error!,
-                style: const TextStyle(color: Colors.redAccent, fontSize: 12)),
-          ],
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                flex: 2,
-                child: FilledButton(
-                  style: FilledButton.styleFrom(
-                    backgroundColor:
-                        conn.isConnected ? Colors.red.shade700 : Colors.green.shade600,
-                  ),
-                  onPressed: conn.isBusy
-                      ? null
-                      : () {
-                          final ctrl = ref.read(connectionProvider.notifier);
-                          if (conn.isConnected) {
-                            ctrl.disconnect();
-                          } else {
-                            ctrl.connect(
-                              ref.read(transportKindProvider),
-                              wifiHost: ref.read(wifiHostProvider),
-                              wifiPort: ref.read(wifiPortProvider),
-                              interval: Duration(
-                                  milliseconds: ref.read(pollIntervalMsProvider)),
-                            );
-                          }
-                        },
-                  child: Text(conn.isBusy
-                      ? "Подключение…"
-                      : conn.isConnected
-                          ? "Отключить"
-                          : "Подключить"),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: OutlinedButton(
-                  onPressed: conn.isBusy || conn.isConnected
-                      ? null
-                      : () => ref.read(connectionProvider.notifier).connectDemo(
-                            interval: Duration(
-                                milliseconds: ref.read(pollIntervalMsProvider)),
-                          ),
-                  child: const Text("Демо"),
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
+    return ListView.separated(
+      padding: const EdgeInsets.all(16),
+      itemCount: rows.length,
+      separatorBuilder: (_, __) => const SizedBox(height: 8),
+      itemBuilder: (_, i) {
+        final (label, value, unit) = rows[i];
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          decoration: panelDecoration(),
+          child: Row(children: [
+            Expanded(
+                child: Text(label,
+                    style: const TextStyle(color: AppColors.text, fontSize: 14))),
+            Text(value,
+                style: const TextStyle(
+                    color: AppColors.accent,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700)),
+            const SizedBox(width: 4),
+            Text(unit, style: const TextStyle(color: AppColors.textDim, fontSize: 12)),
+          ]),
+        );
+      },
     );
   }
+}
 
-  Widget _statusRow(String label, String value, Color color) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+/// Вкладка «Диагностика» — список разделов вместо сетки иконок.
+class _DiagnosticsTab extends ConsumerWidget {
+  const _DiagnosticsTab();
+
+  void _open(BuildContext c, Widget screen, bool needConn, bool connected) {
+    if (needConn && !connected) {
+      ScaffoldMessenger.of(c).showSnackBar(const SnackBar(
+          content: Text("Нужно подключение. Откройте «Гараж» → «Подключить» или «Демо».")));
+      return;
+    }
+    Navigator.of(c).push(MaterialPageRoute(builder: (_) => screen));
+  }
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final connected = ref.watch(connectionProvider).isConnected;
+    return ListView(
+      padding: const EdgeInsets.all(16),
       children: [
-        Text(label, style: const TextStyle(color: Colors.white70, fontSize: 13)),
-        Text(value, style: TextStyle(color: color, fontSize: 13, fontWeight: FontWeight.w600)),
+        HubTile(icon: Icons.error_outline, color: AppColors.err,
+            title: "Ошибки (DTC)", subtitle: "Чтение и сброс кодов неисправностей",
+            onTap: () => _open(context, const DtcScreen(), true, connected)),
+        HubTile(icon: Icons.ac_unit, color: AppColors.accent2,
+            title: "Стоп-кадр", subtitle: "Параметры в момент ошибки",
+            onTap: () => _open(context, const FreezeFrameScreen(), true, connected)),
+        HubTile(icon: Icons.eco, color: AppColors.ok,
+            title: "Тесты на выбросы", subtitle: "Готовность бортовых мониторов",
+            onTap: () => _open(context, const EmissionsScreen(), true, connected)),
+        HubTile(icon: Icons.badge_outlined, color: AppColors.accent,
+            title: "Идентификаторы ЭБУ", subtitle: "VIN и калибровка",
+            onTap: () => _open(context, const EcuIdScreen(), true, connected)),
+      ],
+    );
+  }
+}
+
+/// Вкладка «Ещё» — приборы, инструменты, гараж, настройки.
+class _MoreTab extends ConsumerWidget {
+  const _MoreTab();
+
+  void _open(BuildContext c, Widget screen, bool needConn, bool connected) {
+    if (needConn && !connected) {
+      ScaffoldMessenger.of(c).showSnackBar(const SnackBar(
+          content: Text("Нужно подключение. Откройте «Гараж» → «Подключить» или «Демо».")));
+      return;
+    }
+    Navigator.of(c).push(MaterialPageRoute(builder: (_) => screen));
+  }
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final connected = ref.watch(connectionProvider).isConnected;
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        const SectionTitle("Приборы"),
+        HubTile(icon: Icons.donut_large, color: AppColors.accent,
+            title: "Показатели", subtitle: "Круговые приборы",
+            onTap: () => _open(context, const GaugesScreen(), true, connected)),
+        HubTile(icon: Icons.memory, color: AppColors.accent2,
+            title: "Мониторинг ЭБУ", subtitle: "Живой поток параметров",
+            onTap: () => _open(context, const SensorListScreen(title: "Мониторинг ЭБУ"), true, connected)),
+        const SectionTitle("Инструменты"),
+        HubTile(icon: Icons.timer_outlined, color: AppColors.warn,
+            title: "Замер разгона", subtitle: "0–60 и 0–100 км/ч",
+            onTap: () => _open(context, const AccelerationScreen(), true, connected)),
+        HubTile(icon: Icons.save_alt, color: AppColors.accent2,
+            title: "Запись данных", subtitle: "Лог телеметрии и экспорт CSV",
+            onTap: () => _open(context, const DataLoggingScreen(), true, connected)),
+        HubTile(icon: Icons.bar_chart, color: AppColors.ok,
+            title: "Статистика", subtitle: "Мин / тек / макс",
+            onTap: () => _open(context, const StatisticsScreen(), true, connected)),
+        const SectionTitle("Настройки"),
+        HubTile(icon: Icons.directions_car_filled, color: AppColors.accent,
+            title: "Мои автомобили", subtitle: "Профили машин",
+            onTap: () => _open(context, const MyCarsScreen(), false, connected)),
+        HubTile(icon: Icons.tune, color: AppColors.textDim,
+            title: "Настройки", subtitle: "Адаптер, Wi-Fi, опрос",
+            onTap: () => _open(context, const SettingsScreen(), false, connected)),
       ],
     );
   }
@@ -2060,9 +2432,9 @@ class SensorListScreen extends ConsumerWidget {
     final tele = ref.watch(telemetryProvider);
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0E1116),
+      backgroundColor: const Color(0xFF0C100F),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF161B22),
+        backgroundColor: const Color(0xFF171D1C),
         title: Text(title),
         actions: [_StatusChip(conn.link)],
       ),
@@ -2102,23 +2474,345 @@ class SensorListScreen extends ConsumerWidget {
 
 // ===== экран «Ошибки (DTC)» =====
 
-class DtcScreen extends ConsumerWidget {
+class DtcScreen extends ConsumerStatefulWidget {
   const DtcScreen({super.key});
+  @override
+  ConsumerState<DtcScreen> createState() => _DtcScreenState();
+}
+
+class _DtcScreenState extends ConsumerState<DtcScreen> {
+  Readiness? _readiness;
+  List<String> _stored = [];
+  List<String> _pending = [];
+  List<String> _permanent = [];
+  bool _loading = false;
+  bool _loaded = false;
+  String? _error;
+
+  ObdService? get _svc => ref.read(connectionProvider.notifier).service;
+
+  Future<void> _scan() async {
+    final svc = _svc;
+    if (svc == null) return;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      try {
+        _readiness = await svc.readReadiness();
+      } catch (_) {/* не критично */}
+      _stored = await svc.readDtc();
+      try {
+        _pending = await svc.readPendingDtc();
+      } catch (_) {}
+      try {
+        _permanent = await svc.readPermanentDtc();
+      } catch (_) {}
+      _loaded = true;
+    } catch (e) {
+      setState(() => _error = "$e");
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _clear() async {
+    final svc = _svc;
+    if (svc == null) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: const Text("Сбросить ошибки?", style: TextStyle(color: AppColors.text)),
+        content: const Text(
+            "Check Engine погаснет, стоп-кадр будет стёрт, а мониторы выбросов "
+            "сбросятся в «не готов». Постоянные коды (Mode 0A) так не стираются. "
+            "Автомобиль должен стоять (V=0). Продолжить?",
+            style: TextStyle(color: AppColors.textDim)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text("Отмена")),
+          FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: AppColors.err),
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text("Сбросить")),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      await svc.clearDtc(userConfirmed: true);
+      await _scan();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Команда сброса отправлена")));
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("$e"), backgroundColor: AppColors.err));
+      }
+    }
+  }
+
+  void _showDetail(String code, String kind, Color kindColor) {
+    final info = DtcCatalog.describe(code);
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: AppColors.surface,
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(22))),
+      builder: (_) => Padding(
+        padding: const EdgeInsets.fromLTRB(20, 18, 20, 28),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              Text(info.code,
+                  style: const TextStyle(
+                      color: AppColors.text, fontSize: 26, fontWeight: FontWeight.w800)),
+              const Spacer(),
+              IconButton(
+                icon: const Icon(Icons.copy, color: AppColors.textDim, size: 20),
+                onPressed: () {
+                  Clipboard.setData(ClipboardData(text: info.code));
+                  ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text("Код скопирован")));
+                },
+              ),
+            ]),
+            const SizedBox(height: 6),
+            Wrap(spacing: 8, runSpacing: 8, children: [
+              _tag(kind, kindColor),
+              _tag(info.system, AppColors.accent2),
+              _tag(info.generic ? "Общий (SAE)" : "Производителя", AppColors.textDim),
+            ]),
+            const SizedBox(height: 16),
+            Text(info.description,
+                style: const TextStyle(color: AppColors.text, fontSize: 15, height: 1.4)),
+            const SizedBox(height: 18),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                icon: const Icon(Icons.search),
+                label: const Text("Скопировать код для поиска"),
+                style: OutlinedButton.styleFrom(foregroundColor: AppColors.accent),
+                onPressed: () {
+                  Clipboard.setData(ClipboardData(text: info.code));
+                  Navigator.pop(context);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text("Код скопирован — вставьте в поиск")));
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _tag(String text, Color color) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        decoration: BoxDecoration(
+            color: color.withOpacity(0.16), borderRadius: BorderRadius.circular(8)),
+        child: Text(text,
+            style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w600)),
+      );
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  Widget build(BuildContext context) {
     final conn = ref.watch(connectionProvider);
+    final total = _stored.length + _pending.length + _permanent.length;
     return Scaffold(
-      backgroundColor: const Color(0xFF0E1116),
+      backgroundColor: const Color(0xFF0C100F),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF161B22),
+        backgroundColor: const Color(0xFF171D1C),
         title: const Text("Ошибки (DTC)"),
-        actions: [_StatusChip(conn.link)],
+        actions: [
+          if (conn.isConnected && _loaded)
+            IconButton(
+                icon: const Icon(Icons.refresh),
+                tooltip: "Пересканировать",
+                onPressed: _loading ? null : _scan),
+          _StatusChip(conn.link),
+        ],
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: conn.isConnected ? const _DtcPanel() : const _NotConnected(),
-      ),
+      body: !conn.isConnected
+          ? const _NotConnected()
+          : ListView(
+              padding: const EdgeInsets.all(16),
+              children: [
+                _summaryCard(total),
+                if (_error != null) ...[
+                  const SizedBox(height: 12),
+                  Text(_error!, style: const TextStyle(color: AppColors.err)),
+                ],
+                if (_loading) ...[
+                  const SizedBox(height: 16),
+                  const Center(child: CircularProgressIndicator()),
+                ],
+                if (_loaded && !_loading) ...[
+                  _section("Сохранённые", _stored, AppColors.err,
+                      "Подтверждённые коды — горит Check Engine"),
+                  _section("Ожидающие", _pending, AppColors.warn,
+                      "Замечены, но ещё не подтверждены"),
+                  _section("Постоянные", _permanent, AppColors.accent2,
+                      "Сканером не стираются, гаснут сами"),
+                  if (total == 0)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 24),
+                      child: Column(children: const [
+                        Icon(Icons.verified, color: AppColors.ok, size: 48),
+                        SizedBox(height: 10),
+                        Text("Ошибок не найдено",
+                            style: TextStyle(color: AppColors.text, fontSize: 16)),
+                      ]),
+                    ),
+                ],
+              ],
+            ),
+      bottomNavigationBar: !conn.isConnected
+          ? null
+          : SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                child: Row(children: [
+                  Expanded(
+                    flex: 2,
+                    child: FilledButton.icon(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: AppColors.accent,
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                      ),
+                      icon: const Icon(Icons.search),
+                      label: Text(_loaded ? "Пересканировать" : "Сканировать ошибки"),
+                      onPressed: _loading ? null : _scan,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: AppColors.err,
+                        side: const BorderSide(color: AppColors.err),
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                      ),
+                      icon: const Icon(Icons.delete_outline),
+                      label: const Text("Сброс"),
+                      onPressed: _stored.isEmpty || _loading ? null : _clear,
+                    ),
+                  ),
+                ]),
+              ),
+            ),
+    );
+  }
+
+  Widget _summaryCard(int total) {
+    final mil = _readiness?.milOn ?? false;
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: panelDecoration(
+          border: (_loaded && total > 0) ? AppColors.err.withOpacity(0.4) : null),
+      child: Row(children: [
+        Container(
+          width: 54,
+          height: 54,
+          decoration: BoxDecoration(
+            color: (mil ? AppColors.err : AppColors.ok).withOpacity(0.15),
+            shape: BoxShape.circle,
+          ),
+          child: Icon(mil ? Icons.warning_amber_rounded : Icons.check_circle,
+              color: mil ? AppColors.err : AppColors.ok, size: 28),
+        ),
+        const SizedBox(width: 14),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                !_loaded
+                    ? "Готов к сканированию"
+                    : mil
+                        ? "Check Engine горит"
+                        : "Check Engine не горит",
+                style: const TextStyle(
+                    color: AppColors.text, fontSize: 16, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                !_loaded
+                    ? "Нажмите «Сканировать ошибки»"
+                    : "Сохранённых: ${_stored.length} • ожидающих: ${_pending.length} • постоянных: ${_permanent.length}",
+                style: const TextStyle(color: AppColors.textDim, fontSize: 12.5),
+              ),
+            ],
+          ),
+        ),
+      ]),
+    );
+  }
+
+  Widget _section(String title, List<String> codes, Color color, String hint) {
+    if (codes.isEmpty) return const SizedBox.shrink();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 18),
+        Row(children: [
+          SectionTitle("$title (${codes.length})"),
+        ]),
+        Padding(
+          padding: const EdgeInsets.only(left: 12, bottom: 6),
+          child: Text(hint, style: const TextStyle(color: AppColors.textDim, fontSize: 11.5)),
+        ),
+        ...codes.map((c) {
+          final info = DtcCatalog.describe(c);
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Material(
+              color: Colors.transparent,
+              child: InkWell(
+                borderRadius: BorderRadius.circular(14),
+                onTap: () => _showDetail(c, title, color),
+                child: Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: panelDecoration(),
+                  child: Row(children: [
+                    Container(
+                      width: 8,
+                      height: 38,
+                      decoration: BoxDecoration(
+                          color: color, borderRadius: BorderRadius.circular(4)),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(info.code,
+                              style: const TextStyle(
+                                  color: AppColors.text,
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w700)),
+                          const SizedBox(height: 2),
+                          Text(info.description,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                  color: AppColors.textDim, fontSize: 12.5)),
+                        ],
+                      ),
+                    ),
+                    const Icon(Icons.chevron_right, color: AppColors.textDim),
+                  ]),
+                ),
+              ),
+            ),
+          );
+        }),
+      ],
     );
   }
 }
@@ -2158,9 +2852,9 @@ class _FreezeFrameScreenState extends ConsumerState<FreezeFrameScreen> {
   Widget build(BuildContext context) {
     final conn = ref.watch(connectionProvider);
     return Scaffold(
-      backgroundColor: const Color(0xFF0E1116),
+      backgroundColor: const Color(0xFF0C100F),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF161B22),
+        backgroundColor: const Color(0xFF171D1C),
         title: const Text("Стоп-кадр"),
         actions: [_StatusChip(conn.link)],
       ),
@@ -2261,9 +2955,9 @@ class _EcuIdScreenState extends ConsumerState<EcuIdScreen> {
   Widget build(BuildContext context) {
     final conn = ref.watch(connectionProvider);
     return Scaffold(
-      backgroundColor: const Color(0xFF0E1116),
+      backgroundColor: const Color(0xFF0C100F),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF161B22),
+        backgroundColor: const Color(0xFF171D1C),
         title: const Text("Идентификаторы ЭБУ"),
         actions: [_StatusChip(conn.link)],
       ),
@@ -2299,7 +2993,7 @@ class _EcuIdScreenState extends ConsumerState<EcuIdScreen> {
 
   Widget _idCard(String label, String? value) {
     return Card(
-      color: const Color(0xFF161B22),
+      color: const Color(0xFF171D1C),
       child: ListTile(
         title: Text(label, style: const TextStyle(color: Colors.white54, fontSize: 13)),
         subtitle: SelectableText(
@@ -2348,9 +3042,9 @@ class _EmissionsScreenState extends ConsumerState<EmissionsScreen> {
     final conn = ref.watch(connectionProvider);
     final d = _data;
     return Scaffold(
-      backgroundColor: const Color(0xFF0E1116),
+      backgroundColor: const Color(0xFF0C100F),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF161B22),
+        backgroundColor: const Color(0xFF171D1C),
         title: const Text("Тесты на выбросы"),
         actions: [_StatusChip(conn.link)],
       ),
@@ -2436,9 +3130,9 @@ class StatisticsScreen extends ConsumerWidget {
     final stats = svc?.statistics ?? const <String, MinMax>{};
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0E1116),
+      backgroundColor: const Color(0xFF0C100F),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF161B22),
+        backgroundColor: const Color(0xFF171D1C),
         title: const Text("Статистика"),
         actions: [
           if (svc != null)
@@ -2561,7 +3255,7 @@ class _DataLoggingScreenState extends ConsumerState<DataLoggingScreen> {
     showDialog(
       context: context,
       builder: (_) => AlertDialog(
-        backgroundColor: const Color(0xFF161B22),
+        backgroundColor: const Color(0xFF171D1C),
         title: Text("CSV • строк: ${_rows.length}",
             style: const TextStyle(color: Colors.white)),
         content: SizedBox(
@@ -2589,9 +3283,9 @@ class _DataLoggingScreenState extends ConsumerState<DataLoggingScreen> {
   Widget build(BuildContext context) {
     final conn = ref.watch(connectionProvider);
     return Scaffold(
-      backgroundColor: const Color(0xFF0E1116),
+      backgroundColor: const Color(0xFF0C100F),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF161B22),
+        backgroundColor: const Color(0xFF171D1C),
         title: const Text("Запись данных"),
         actions: [_StatusChip(conn.link)],
       ),
@@ -2727,9 +3421,9 @@ class _AccelerationScreenState extends ConsumerState<AccelerationScreen> {
   Widget build(BuildContext context) {
     final conn = ref.watch(connectionProvider);
     return Scaffold(
-      backgroundColor: const Color(0xFF0E1116),
+      backgroundColor: const Color(0xFF0C100F),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF161B22),
+        backgroundColor: const Color(0xFF171D1C),
         title: const Text("Замер разгона"),
         actions: [_StatusChip(conn.link)],
       ),
@@ -2799,7 +3493,7 @@ class MyCarsScreen extends ConsumerWidget {
     final ok = await showDialog<bool>(
       context: context,
       builder: (_) => AlertDialog(
-        backgroundColor: const Color(0xFF161B22),
+        backgroundColor: const Color(0xFF171D1C),
         title: const Text("Новый автомобиль", style: TextStyle(color: Colors.white)),
         content: Column(
           mainAxisSize: MainAxisSize.min,
@@ -2837,9 +3531,9 @@ class MyCarsScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final cars = ref.watch(vehiclesProvider);
     return Scaffold(
-      backgroundColor: const Color(0xFF0E1116),
+      backgroundColor: const Color(0xFF0C100F),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF161B22),
+        backgroundColor: const Color(0xFF171D1C),
         title: const Text("Мои автомобили"),
       ),
       floatingActionButton: FloatingActionButton(
@@ -2851,7 +3545,7 @@ class MyCarsScreen extends ConsumerWidget {
         itemBuilder: (_, i) {
           final c = cars[i];
           return Card(
-            color: const Color(0xFF161B22),
+            color: const Color(0xFF171D1C),
             margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
             child: ListTile(
               leading: const Icon(Icons.directions_car, color: Colors.cyanAccent),
@@ -2884,9 +3578,9 @@ class SettingsScreen extends ConsumerWidget {
     final interval = ref.watch(pollIntervalMsProvider);
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0E1116),
+      backgroundColor: const Color(0xFF0C100F),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF161B22),
+        backgroundColor: const Color(0xFF171D1C),
         title: const Text("Настройки"),
       ),
       body: ListView(
@@ -2979,15 +3673,28 @@ class ObdApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = ColorScheme.fromSeed(
+      seedColor: AppColors.accent,
+      brightness: Brightness.dark,
+    ).copyWith(
+      surface: AppColors.surface,
+      secondary: AppColors.accent2,
+    );
     return MaterialApp(
-      title: "Car Scanner",
+      title: "Revoscan",
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
         brightness: Brightness.dark,
-        colorSchemeSeed: Colors.blue,
+        scaffoldBackgroundColor: AppColors.bg,
+        colorScheme: scheme,
+        fontFamily: 'Roboto',
+        snackBarTheme: const SnackBarThemeData(
+          backgroundColor: AppColors.surface2,
+          contentTextStyle: TextStyle(color: AppColors.text),
+        ),
       ),
-      home: const HomeMenuScreen(),
+      home: const RootShell(),
     );
   }
 }
