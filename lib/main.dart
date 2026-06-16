@@ -237,6 +237,118 @@ class ObdParsers {
     }
     return codes;
   }
+
+  /// VIN (Mode 09, PID 02). Ответ многокадровый ISO-TP, но после нормализации
+  /// (ATS0) приходит склеенной строкой. Ищем эхо "4902", пропускаем байт
+  /// счётчика сообщений и переводим оставшиеся байты в ASCII.
+  static String? vin(String resp) {
+    final idx = resp.indexOf("4902");
+    if (idx < 0) return null;
+    var hex = resp.substring(idx + 4);
+    if (hex.length >= 2) hex = hex.substring(2); // байт-счётчик (обычно 01)
+    final sb = StringBuffer();
+    for (int i = 0; i + 2 <= hex.length; i += 2) {
+      final b = int.tryParse(hex.substring(i, i + 2), radix: 16);
+      if (b == null) continue;
+      if (b >= 0x20 && b < 0x7F) sb.write(String.fromCharCode(b));
+    }
+    // VIN не содержит I, O, Q — отбрасываем мусор и берём 17 последних символов.
+    final clean = sb.toString().replaceAll(RegExp(r'[^A-HJ-NPR-Z0-9]'), '');
+    if (clean.length < 11) return null;
+    return clean.length > 17 ? clean.substring(clean.length - 17) : clean;
+  }
+
+  /// Текстовый ответ Mode 09 (имя ЭБУ 090A, Calibration ID 0904 и т.п.).
+  /// echoPrefix — например "490A". Возвращает читаемую ASCII-строку.
+  static String? mode09Text(String resp, String echoPrefix) {
+    final idx = resp.indexOf(echoPrefix);
+    if (idx < 0) return null;
+    var hex = resp.substring(idx + echoPrefix.length);
+    if (hex.length >= 2) hex = hex.substring(2); // байт-счётчик
+    final sb = StringBuffer();
+    for (int i = 0; i + 2 <= hex.length; i += 2) {
+      final b = int.tryParse(hex.substring(i, i + 2), radix: 16);
+      if (b == null) continue;
+      if (b >= 0x20 && b < 0x7F) sb.write(String.fromCharCode(b));
+    }
+    final s = sb.toString().trim();
+    return s.isEmpty ? null : s;
+  }
+
+  /// Данные стоп-кадра (Mode 02). Ответ: 42 <PID> <frame#> <данные...>.
+  /// Возвращает только полезные байты (без mode/pid/frame).
+  static List<int>? freezeData(String resp, String pid) {
+    if (_isGarbage(resp)) return null;
+    final bytes = <int>[];
+    for (int i = 0; i + 2 <= resp.length; i += 2) {
+      final b = int.tryParse(resp.substring(i, i + 2), radix: 16);
+      if (b == null) return null;
+      bytes.add(b);
+    }
+    final pidByte = int.parse(pid, radix: 16);
+    for (int i = 0; i + 3 <= bytes.length; i++) {
+      if (bytes[i] == 0x42 && bytes[i + 1] == pidByte) {
+        return bytes.sublist(i + 3); // пропускаем mode(42), pid, frame#
+      }
+    }
+    return null;
+  }
+
+  /// Готовность мониторов (Mode 01, PID 01). Используется для теста на выбросы.
+  /// A: бит7 — лампа Check Engine, биты6-0 — число сохранённых DTC.
+  /// B: поддержка/готовность непрерывных мониторов.
+  /// C/D: поддержка/готовность некоторых периодических мониторов.
+  static Readiness? readiness(String resp) {
+    final d = extractData(resp, "01", "01");
+    if (d == null || d.length < 4) return null;
+    final a = d[0], b = d[1], c = d[2], e = d[3];
+
+    final monitors = <MonitorStatus>[
+      // Непрерывные мониторы (байт B): бит поддержки vs бит готовности (+4).
+      MonitorStatus("Пропуски зажигания", (b & 0x01) != 0, (b & 0x10) == 0),
+      MonitorStatus("Топливная система", (b & 0x02) != 0, (b & 0x20) == 0),
+      MonitorStatus("Компоненты двигателя", (b & 0x04) != 0, (b & 0x40) == 0),
+    ];
+    // Периодические мониторы: C — поддержка, D — готовность (0 = завершён).
+    const names = [
+      "Катализатор",
+      "Подогрев катализатора",
+      "Система EVAP",
+      "Вторичный воздух",
+      "Хладагент A/C",
+      "Кислородный датчик",
+      "Подогрев кисл. датчика",
+      "Система EGR/VVT",
+    ];
+    for (int i = 0; i < 8; i++) {
+      monitors.add(MonitorStatus(
+        names[i],
+        (c & (1 << i)) != 0,
+        (e & (1 << i)) == 0,
+      ));
+    }
+    return Readiness(milOn: (a & 0x80) != 0, dtcCount: a & 0x7F, monitors: monitors);
+  }
+}
+
+/// Сводка готовности бортовых мониторов для теста на выбросы.
+class Readiness {
+  final bool milOn;
+  final int dtcCount;
+  final List<MonitorStatus> monitors;
+  const Readiness({
+    required this.milOn,
+    required this.dtcCount,
+    required this.monitors,
+  });
+}
+
+/// Состояние одного диагностического монитора.
+class MonitorStatus {
+  final String name;
+  final bool supported;
+  final bool complete; // true = тест завершён (готов)
+  const MonitorStatus(this.name, this.supported, this.complete);
 }
 
 /// Каталог PID для удобного опроса.
@@ -463,6 +575,12 @@ class ObdService {
   final _telemetry = StreamController<Telemetry>.broadcast();
   Stream<Telemetry> get telemetry => _telemetry.stream;
   Telemetry _last = const Telemetry();
+  Telemetry get lastTelemetry => _last;
+
+  /// Накопленная статистика (min/max/last) по каждому параметру.
+  final Map<String, MinMax> _stats = {};
+  Map<String, MinMax> get statistics => Map.unmodifiable(_stats);
+  void resetStatistics() => _stats.clear();
 
   Timer? _pollTimer;
   int _consecutiveTimeouts = 0;
@@ -615,7 +733,76 @@ class ObdService {
 
   void _emit(Telemetry t) {
     _last = t;
+    _trackStat("Обороты", "об/мин", t.rpm?.toDouble());
+    _trackStat("Скорость", "км/ч", t.speed?.toDouble());
+    _trackStat("Темп. ОЖ", "°C", t.coolant?.toDouble());
+    _trackStat("Нагрузка", "%", t.load);
+    _trackStat("Напряжение", "В", t.voltage);
+    _trackStat("Темп. впуска", "°C", t.intakeTemp?.toDouble());
+    _trackStat("Топливо", "%", t.fuelLevel);
+    _trackStat("MAF", "г/с", t.maf);
+    _trackStat("Наддув (MAP)", "кПа", t.map?.toDouble());
+    _trackStat("Опереж. зажиг.", "°", t.timing);
+    _trackStat("Темп. за бортом", "°C", t.ambient?.toDouble());
+    _trackStat("Расход", "л/ч", t.fuelRate);
     _telemetry.add(t);
+  }
+
+  void _trackStat(String name, String unit, double? value) {
+    if (value == null) return;
+    final s = _stats[name];
+    if (s == null) {
+      _stats[name] = MinMax(unit: unit, min: value, max: value, last: value);
+    } else {
+      s.last = value;
+      if (value < s.min) s.min = value;
+      if (value > s.max) s.max = value;
+    }
+  }
+
+  /// Прочитать VIN (Mode 09 PID 02).
+  Future<String?> readVin() async {
+    final resp = await _queue.enqueue("0902", timeout: const Duration(seconds: 3));
+    return ObdParsers.vin(resp);
+  }
+
+  /// Прочитать имя/калибровку ЭБУ (Mode 09 PID 0A).
+  Future<String?> readEcuName() async {
+    final resp = await _queue.enqueue("090A", timeout: const Duration(seconds: 3));
+    return ObdParsers.mode09Text(resp, "490A");
+  }
+
+  /// Прочитать готовность мониторов выбросов (Mode 01 PID 01).
+  Future<Readiness?> readReadiness() async {
+    final resp = await _queue.enqueue("0101", timeout: const Duration(seconds: 3));
+    return ObdParsers.readiness(resp);
+  }
+
+  /// Прочитать стоп-кадр (Mode 02): значения ключевых параметров на момент,
+  /// когда ЭБУ зафиксировал ошибку. Запрос — "02 <PID> 00" (кадр 0).
+  Future<List<FreezeEntry>> readFreezeFrame() async {
+    final result = <FreezeEntry>[];
+
+    Future<void> one(String pid, String label, String unit,
+        double? Function(List<int>) calc) async {
+      try {
+        final resp = await _queue.enqueue("02${pid}00");
+        final d = ObdParsers.freezeData(resp, pid);
+        if (d == null || d.isEmpty) return;
+        final v = calc(d);
+        if (v != null) result.add(FreezeEntry(label, v, unit));
+      } catch (_) {/* пропускаем недоступный PID */}
+    }
+
+    await one("04", "Нагрузка", "%", (d) => d[0] * 100 / 255);
+    await one("05", "Темп. ОЖ", "°C", (d) => (d[0] - 40).toDouble());
+    await one("0C", "Обороты", "об/мин",
+        (d) => d.length < 2 ? null : ((d[0] * 256 + d[1]) / 4));
+    await one("0D", "Скорость", "км/ч", (d) => d[0].toDouble());
+    await one("11", "Дроссель", "%", (d) => d[0] * 100 / 255);
+    await one("10", "MAF", "г/с",
+        (d) => d.length < 2 ? null : ((d[0] * 256 + d[1]) / 100));
+    return result;
   }
 
   /// Прочитать сохранённые коды ошибок.
@@ -875,6 +1062,162 @@ class WifiTransport implements ObdTransport {
 }
 
 
+// ===== вспомогательные модели =====
+
+/// Накопленный диапазон значения параметра (для экрана статистики).
+class MinMax {
+  final String unit;
+  double min;
+  double max;
+  double last;
+  MinMax({required this.unit, required this.min, required this.max, required this.last});
+}
+
+/// Одна строка стоп-кадра.
+class FreezeEntry {
+  final String label;
+  final double value;
+  final String unit;
+  const FreezeEntry(this.label, this.value, this.unit);
+}
+
+
+// ===== демо-транспорт =====
+
+/// Виртуальный адаптер для режима «Демо»: не требует железа, генерирует
+/// правдоподобные ответы ELM327, чтобы можно было посмотреть приложение
+/// без подключения к автомобилю. Реализует тот же контракт ObdTransport,
+/// поэтому весь доменный слой работает без изменений.
+class FakeTransport implements ObdTransport {
+  final _incoming = StreamController<List<int>>.broadcast();
+  final _state = StreamController<LinkState>.broadcast();
+  final _rnd = Random();
+  DateTime _start = DateTime.now();
+  bool _connected = false;
+
+  @override
+  Stream<List<int>> get incoming => _incoming.stream;
+  @override
+  Stream<LinkState> get linkState => _state.stream;
+  @override
+  bool get isConnected => _connected;
+
+  @override
+  Future<void> connect() async {
+    _state.add(LinkState.connecting);
+    _start = DateTime.now();
+    await Future.delayed(const Duration(milliseconds: 200));
+    _connected = true;
+    _state.add(LinkState.connected);
+  }
+
+  @override
+  Future<void> disconnect() async {
+    _connected = false;
+    _state.add(LinkState.disconnected);
+  }
+
+  @override
+  Future<void> write(String command) async {
+    final resp = _responseFor(command.toUpperCase().trim());
+    // ELM327 завершает ответ символом '>'; имитируем задержку линка.
+    Future.delayed(Duration(milliseconds: 12 + _rnd.nextInt(20)), () {
+      if (!_incoming.isClosed) _incoming.add(utf8.encode("$resp\r\r>"));
+    });
+  }
+
+  String _hex2(int v) => (v & 0xFF).toRadixString(16).padLeft(2, '0').toUpperCase();
+  String _asciiHex(String s) =>
+      s.codeUnits.map((c) => _hex2(c)).join();
+
+  String _responseFor(String cmd) {
+    final t = DateTime.now().difference(_start).inMilliseconds / 1000.0;
+
+    // Служебные AT-команды.
+    if (cmd == "ATZ") return "ELM327 v1.5";
+    if (cmd == "ATRV") {
+      final v = 13.8 + sin(t / 3) * 0.6;
+      return "${v.toStringAsFixed(1)}V";
+    }
+    if (cmd.startsWith("AT")) return "OK";
+
+    // Маски поддержки PID — заявляем широкую поддержку.
+    if (cmd == "0100") return "4100FFFFFFFE";
+    if (cmd == "0120") return "4120FFFFFFFF";
+    if (cmd == "0140") return "4140FFFFFFFE";
+
+    // Готовность мониторов: лампа выключена, ошибок нет, тесты пройдены.
+    if (cmd == "0101") return "410100072100";
+
+    // Коды ошибок (демо): P0133, P0420.
+    if (cmd == "03") return "4301330420";
+    if (cmd == "04") return "44"; // сброс выполнен
+
+    // VIN и имя ЭБУ.
+    if (cmd == "0902") return "490201${_asciiHex("WAUZZZ8K9BA123456")}";
+    if (cmd == "090A") return "490A01${_asciiHex("ECM-EngineControl")}";
+
+    // Стоп-кадр: 02 <PID> 00 → 42 <PID> 00 <данные>.
+    if (cmd.startsWith("02") && cmd.length >= 4) {
+      final pid = cmd.substring(2, 4);
+      final data = _pidData(pid, t, frozen: true);
+      if (data != null) return "42${pid}00$data";
+      return "NODATA";
+    }
+
+    // Текущие данные Mode 01.
+    if (cmd.startsWith("01") && cmd.length >= 4) {
+      final pid = cmd.substring(2, 4);
+      final data = _pidData(pid, t, frozen: false);
+      if (data != null) return "41$pid$data";
+      return "NODATA";
+    }
+
+    return "NODATA";
+  }
+
+  /// HEX-данные для конкретного PID. frozen=true даёт «замороженные» значения.
+  String? _pidData(String pid, double t, {required bool frozen}) {
+    double wave(double base, double amp, double period) =>
+        base + (frozen ? amp * 0.5 : (sin(t / period) * 0.5 + 0.5) * amp);
+
+    switch (pid) {
+      case "0C": // RPM
+        final rpm = wave(820, 2600, 1.7).round();
+        final raw = rpm * 4;
+        return _hex2(raw >> 8) + _hex2(raw & 0xFF);
+      case "0D": // скорость
+        return _hex2(wave(0, 90, 2.3).round());
+      case "05": // темп. ОЖ — прогрев к ~90°C
+        final temp = (35 + min(55, t * 4)).round();
+        return _hex2(temp + 40);
+      case "04": // нагрузка
+        return _hex2((wave(15, 70, 1.9) * 255 / 100).round());
+      case "11": // дроссель
+        return _hex2((wave(12, 60, 1.7) * 255 / 100).round());
+      case "0F": // темп. впуска
+        return _hex2((28 + sin(t / 5) * 4).round() + 40);
+      case "2F": // уровень топлива
+        return _hex2((62 * 255 / 100).round());
+      case "10": // MAF
+        final maf = wave(3, 45, 1.8);
+        final raw = (maf * 100).round();
+        return _hex2(raw >> 8) + _hex2(raw & 0xFF);
+      case "0B": // MAP
+        return _hex2(wave(30, 120, 1.8).round());
+      case "0E": // опережение зажигания
+        return _hex2(((wave(8, 22, 2.1) + 64) * 2).round());
+      case "46": // темп. за бортом
+        return _hex2(19 + 40);
+      case "0A": // давление топлива
+        return _hex2(128);
+      default:
+        return null;
+    }
+  }
+}
+
+
 // ===== из connection_provider.dart =====
 
 /// Тип транспорта, выбранный пользователем.
@@ -885,13 +1228,23 @@ final transportKindProvider = StateProvider<TransportKind>((ref) {
   return TransportKind.ble;
 });
 
+/// Настройки Wi-Fi-адаптера.
+final wifiHostProvider = StateProvider<String>((ref) => "192.168.0.10");
+final wifiPortProvider = StateProvider<int>((ref) => 35000);
+
+/// Частота опроса (мс между циклами).
+final pollIntervalMsProvider = StateProvider<int>((ref) => 200);
+
 /// Фабрика транспорта по выбранному типу.
-ObdTransport _buildTransport(TransportKind kind) {
+ObdTransport _buildTransport(TransportKind kind, {String? host, int? port}) {
   switch (kind) {
     case TransportKind.ble:
       return BleTransport();
     case TransportKind.wifi:
-      return WifiTransport(); // 192.168.0.10:35000 по умолчанию
+      return WifiTransport(
+        host: host ?? "192.168.0.10",
+        port: port ?? 35000,
+      );
     case TransportKind.btClassic:
       return BleTransport(); // BT Classic убран
   }
@@ -915,16 +1268,40 @@ class ConnectionController extends StateNotifier<ConnectionUiState> {
     }
   }
 
-  Future<void> connect(TransportKind kind) async {
-    try {
-      state = state.copyWith(link: LinkState.connecting, error: null);
-      await _ensurePermissions(kind);
+  Future<void> connect(
+    TransportKind kind, {
+    String? wifiHost,
+    int? wifiPort,
+    Duration interval = const Duration(milliseconds: 200),
+  }) async {
+    await _start(
+      _buildTransport(kind, host: wifiHost, port: wifiPort),
+      interval: interval,
+      demo: false,
+      ensure: () => _ensurePermissions(kind),
+    );
+  }
 
-      final transport = _buildTransport(kind);
+  /// Демо-режим: виртуальный адаптер, без железа и без BT-разрешений.
+  Future<void> connectDemo({
+    Duration interval = const Duration(milliseconds: 200),
+  }) async {
+    await _start(FakeTransport(), interval: interval, demo: true);
+  }
+
+  Future<void> _start(
+    ObdTransport transport, {
+    required Duration interval,
+    required bool demo,
+    Future<void> Function()? ensure,
+  }) async {
+    try {
+      state = state.copyWith(link: LinkState.connecting, error: null, demo: demo);
+      if (ensure != null) await ensure();
+
       final service = ObdService(transport);
       _service = service;
 
-      // транслируем состояние линка в UI
       transport.linkState.listen((s) {
         state = state.copyWith(link: s);
         if (s == LinkState.disconnected) _service?.stopPolling();
@@ -935,7 +1312,7 @@ class ConnectionController extends StateNotifier<ConnectionUiState> {
       state = state.copyWith(link: LinkState.initializing);
       await service.initialize();
 
-      service.startPolling();
+      service.startPolling(interval: interval);
       state = state.copyWith(link: LinkState.connected);
     } catch (e) {
       state = state.copyWith(link: LinkState.error, error: e.toString());
@@ -953,10 +1330,25 @@ class ConnectionController extends StateNotifier<ConnectionUiState> {
 class ConnectionUiState {
   final LinkState link;
   final String? error;
-  const ConnectionUiState({this.link = LinkState.disconnected, this.error});
+  final bool demo;
+  const ConnectionUiState({
+    this.link = LinkState.disconnected,
+    this.error,
+    this.demo = false,
+  });
 
-  ConnectionUiState copyWith({LinkState? link, String? error}) =>
-      ConnectionUiState(link: link ?? this.link, error: error);
+  bool get isConnected => link == LinkState.connected;
+  bool get isBusy =>
+      link == LinkState.connecting ||
+      link == LinkState.initializing ||
+      link == LinkState.scanning;
+
+  ConnectionUiState copyWith({LinkState? link, String? error, bool? demo}) =>
+      ConnectionUiState(
+        link: link ?? this.link,
+        error: error,
+        demo: demo ?? this.demo,
+      );
 }
 
 final connectionProvider =
@@ -966,7 +1358,10 @@ final connectionProvider =
 
 /// Стрим телеметрии для дашборда.
 final telemetryProvider = StreamProvider<Telemetry>((ref) {
-  final ctrl = ref.watch(connectionProvider.notifier);
+  // Перестраиваемся при смене состояния линка, иначе после подключения
+  // (service создаётся позже) стрим телеметрии не подхватился бы.
+  ref.watch(connectionProvider);
+  final ctrl = ref.read(connectionProvider.notifier);
   final svc = ctrl.service;
   if (svc == null) return const Stream.empty();
   return svc.telemetry;
@@ -1081,86 +1476,70 @@ class DashboardScreen extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final conn = ref.watch(connectionProvider);
-    final kind = ref.watch(transportKindProvider);
 
     return Scaffold(
       backgroundColor: const Color(0xFF0E1116),
       appBar: AppBar(
         backgroundColor: const Color(0xFF161B22),
-        title: const Text("OBD Scanner"),
+        title: const Text("Панель приборов"),
         actions: [_StatusChip(conn.link)],
       ),
       body: Padding(
         padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            _TransportSelector(kind: kind),
-            const SizedBox(height: 12),
-            _ConnectBar(state: conn),
-            if (conn.error != null) ...[
-              const SizedBox(height: 8),
-              Text(conn.error!,
-                  style: const TextStyle(color: Colors.redAccent)),
-            ],
-            const SizedBox(height: 16),
-            const Expanded(child: _GaugesGrid()),
-            const _DtcPanel(),
-          ],
-        ),
+        child: conn.isConnected
+            ? Column(
+                children: const [
+                  Expanded(child: _GaugesGrid()),
+                  _DtcPanel(),
+                ],
+              )
+            : const _NotConnected(),
       ),
     );
   }
 }
 
-class _TransportSelector extends ConsumerWidget {
-  final TransportKind kind;
-  const _TransportSelector({required this.kind});
+/// Экран «Показатели» — только круговые приборы во весь экран.
+class GaugesScreen extends ConsumerWidget {
+  const GaugesScreen({super.key});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    return SegmentedButton<TransportKind>(
-      segments: const [
-        ButtonSegment(value: TransportKind.ble, label: Text("BLE")),
-        ButtonSegment(value: TransportKind.btClassic, label: Text("BT")),
-        ButtonSegment(value: TransportKind.wifi, label: Text("Wi-Fi")),
-      ],
-      selected: {kind},
-      onSelectionChanged: (s) =>
-          ref.read(transportKindProvider.notifier).state = s.first,
+    final conn = ref.watch(connectionProvider);
+    return Scaffold(
+      backgroundColor: const Color(0xFF0E1116),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF161B22),
+        title: const Text("Показатели"),
+        actions: [_StatusChip(conn.link)],
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: conn.isConnected ? const _GaugesGrid() : const _NotConnected(),
+      ),
     );
   }
 }
 
-class _ConnectBar extends ConsumerWidget {
-  final ConnectionUiState state;
-  const _ConnectBar({required this.state});
+/// Заглушка для экранов, которым нужно активное соединение.
+class _NotConnected extends StatelessWidget {
+  const _NotConnected();
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final isConnected = state.link == LinkState.connected;
-    final busy = state.link == LinkState.connecting ||
-        state.link == LinkState.initializing ||
-        state.link == LinkState.scanning;
-
-    return SizedBox(
-      width: double.infinity,
-      child: FilledButton.icon(
-        icon: Icon(isConnected ? Icons.link_off : Icons.bluetooth_searching),
-        label: Text(busy
-            ? "Подключение…"
-            : isConnected
-                ? "Отключить"
-                : "Подключить адаптер"),
-        onPressed: busy
-            ? null
-            : () {
-                final ctrl = ref.read(connectionProvider.notifier);
-                if (isConnected) {
-                  ctrl.disconnect();
-                } else {
-                  ctrl.connect(ref.read(transportKindProvider));
-                }
-              },
+  Widget build(BuildContext context) {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: const [
+          Icon(Icons.usb_off, color: Colors.white24, size: 56),
+          SizedBox(height: 12),
+          Text("Нет соединения с адаптером",
+              style: TextStyle(color: Colors.white54, fontSize: 16)),
+          SizedBox(height: 4),
+          Text("Вернитесь на главный экран и нажмите\n«Подключить» или «Демо».",
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.white38, fontSize: 13)),
+        ],
       ),
     );
   }
@@ -1374,6 +1753,1138 @@ class _StatusChip extends StatelessWidget {
 }
 
 
+// ===== модель «Мои автомобили» =====
+
+class Vehicle {
+  final String name;
+  final String vin;
+  const Vehicle(this.name, this.vin);
+}
+
+class VehiclesNotifier extends StateNotifier<List<Vehicle>> {
+  VehiclesNotifier() : super(const [Vehicle("Мой автомобиль", "")]);
+  void add(Vehicle v) => state = [...state, v];
+  void removeAt(int i) => state = [...state]..removeAt(i);
+}
+
+final vehiclesProvider =
+    StateNotifierProvider<VehiclesNotifier, List<Vehicle>>((ref) => VehiclesNotifier());
+
+
+// ===== главное меню =====
+
+/// Описание плитки главного меню.
+class _Feature {
+  final IconData icon;
+  final String label;
+  final Widget Function() builder;
+  final bool needsConnection;
+  const _Feature(this.icon, this.label, this.builder, {this.needsConnection = true});
+}
+
+class HomeMenuScreen extends ConsumerWidget {
+  const HomeMenuScreen({super.key});
+
+  static final _features = <_Feature>[
+    _Feature(Icons.speed, "Панель приборов", () => const DashboardScreen()),
+    _Feature(Icons.show_chart, "Показатели", () => const GaugesScreen()),
+    _Feature(Icons.sensors, "Все датчики", () => const SensorListScreen(title: "Все датчики")),
+    _Feature(Icons.error_outline, "Ошибки (DTC)", () => const DtcScreen()),
+    _Feature(Icons.ac_unit, "Стоп-кадр", () => const FreezeFrameScreen()),
+    _Feature(Icons.memory, "Мониторинг ЭБУ", () => const SensorListScreen(title: "Мониторинг ЭБУ")),
+    _Feature(Icons.directions_car, "Мои автомобили", () => const MyCarsScreen(), needsConnection: false),
+    _Feature(Icons.settings, "Настройки", () => const SettingsScreen(), needsConnection: false),
+    _Feature(Icons.bar_chart, "Статистика", () => const StatisticsScreen()),
+    _Feature(Icons.badge, "Идентификаторы ЭБУ", () => const EcuIdScreen()),
+    _Feature(Icons.save_alt, "Запись данных", () => const DataLoggingScreen()),
+    _Feature(Icons.timer, "Замер разгона", () => const AccelerationScreen()),
+    _Feature(Icons.eco, "Тесты на выбросы", () => const EmissionsScreen()),
+  ];
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final conn = ref.watch(connectionProvider);
+
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF1565C0),
+        centerTitle: true,
+        title: const Text("Car Scanner",
+            style: TextStyle(fontWeight: FontWeight.bold)),
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: GridView.count(
+              crossAxisCount: 3,
+              padding: const EdgeInsets.all(8),
+              children: _features.map((f) {
+                return _MenuTile(
+                  feature: f,
+                  enabled: !f.needsConnection || conn.isConnected,
+                  onTap: () {
+                    if (f.needsConnection && !conn.isConnected) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                            content: Text(
+                                "Сначала подключитесь к адаптеру или включите «Демо».")),
+                      );
+                      return;
+                    }
+                    Navigator.of(context).push(
+                      MaterialPageRoute(builder: (_) => f.builder()),
+                    );
+                  },
+                );
+              }).toList(),
+            ),
+          ),
+          const _HomeConnectBar(),
+        ],
+      ),
+    );
+  }
+}
+
+class _MenuTile extends StatelessWidget {
+  final _Feature feature;
+  final bool enabled;
+  final VoidCallback onTap;
+  const _MenuTile({
+    required this.feature,
+    required this.enabled,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final color = enabled ? const Color(0xFF2196F3) : Colors.white24;
+    return InkWell(
+      onTap: onTap,
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(feature.icon, color: color, size: 40),
+          const SizedBox(height: 8),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4),
+            child: Text(
+              feature.label,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: enabled ? Colors.white : Colors.white38,
+                fontSize: 12,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Нижняя панель: статус линка/ЭБУ и кнопки «Подключить» / «Демо».
+class _HomeConnectBar extends ConsumerWidget {
+  const _HomeConnectBar();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final conn = ref.watch(connectionProvider);
+
+    // «Подключение к ELM» = есть физический линк (initializing и далее),
+    // «Подключение к ЭБУ» = протокол выбран и идёт опрос (connected).
+    final elmOk = conn.link == LinkState.initializing || conn.isConnected;
+    final ecuOk = conn.isConnected;
+
+    String statusText(bool ok) => ok ? "Подключено" : "Отключено";
+    Color statusColor(bool ok) => ok ? Colors.greenAccent : Colors.redAccent;
+
+    return Container(
+      color: const Color(0xFF111418),
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _statusRow("Подключение к ELM:", statusText(elmOk), statusColor(elmOk)),
+          const SizedBox(height: 4),
+          _statusRow("Подключение к ЭБУ:", statusText(ecuOk), statusColor(ecuOk)),
+          if (conn.error != null) ...[
+            const SizedBox(height: 6),
+            Text(conn.error!,
+                style: const TextStyle(color: Colors.redAccent, fontSize: 12)),
+          ],
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                flex: 2,
+                child: FilledButton(
+                  style: FilledButton.styleFrom(
+                    backgroundColor:
+                        conn.isConnected ? Colors.red.shade700 : Colors.green.shade600,
+                  ),
+                  onPressed: conn.isBusy
+                      ? null
+                      : () {
+                          final ctrl = ref.read(connectionProvider.notifier);
+                          if (conn.isConnected) {
+                            ctrl.disconnect();
+                          } else {
+                            ctrl.connect(
+                              ref.read(transportKindProvider),
+                              wifiHost: ref.read(wifiHostProvider),
+                              wifiPort: ref.read(wifiPortProvider),
+                              interval: Duration(
+                                  milliseconds: ref.read(pollIntervalMsProvider)),
+                            );
+                          }
+                        },
+                  child: Text(conn.isBusy
+                      ? "Подключение…"
+                      : conn.isConnected
+                          ? "Отключить"
+                          : "Подключить"),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: conn.isBusy || conn.isConnected
+                      ? null
+                      : () => ref.read(connectionProvider.notifier).connectDemo(
+                            interval: Duration(
+                                milliseconds: ref.read(pollIntervalMsProvider)),
+                          ),
+                  child: const Text("Демо"),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _statusRow(String label, String value, Color color) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(label, style: const TextStyle(color: Colors.white70, fontSize: 13)),
+        Text(value, style: TextStyle(color: color, fontSize: 13, fontWeight: FontWeight.w600)),
+      ],
+    );
+  }
+}
+
+
+// ===== экран «Все датчики» / «Мониторинг ЭБУ» =====
+
+/// Строки телеметрии в виде (название, значение, единица).
+List<(String, String, String)> _sensorRows(Telemetry t) {
+  String n(num? v, [int d = 0]) => v == null ? "—" : v.toStringAsFixed(d);
+  return [
+    ("Обороты", n(t.rpm), "об/мин"),
+    ("Скорость", n(t.speed), "км/ч"),
+    ("Темп. ОЖ", n(t.coolant), "°C"),
+    ("Нагрузка", n(t.load, 1), "%"),
+    ("Напряжение", n(t.voltage, 1), "В"),
+    ("Темп. впуска", n(t.intakeTemp), "°C"),
+    ("Уровень топлива", n(t.fuelLevel, 1), "%"),
+    ("MAF", n(t.maf, 1), "г/с"),
+    ("Наддув (MAP)", n(t.map), "кПа"),
+    ("Опереж. зажигания", n(t.timing, 1), "°"),
+    ("Темп. за бортом", n(t.ambient), "°C"),
+    ("Расход топлива", n(t.fuelRate, 1), "л/ч"),
+  ];
+}
+
+class SensorListScreen extends ConsumerWidget {
+  final String title;
+  const SensorListScreen({super.key, required this.title});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final conn = ref.watch(connectionProvider);
+    final tele = ref.watch(telemetryProvider);
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF0E1116),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF161B22),
+        title: Text(title),
+        actions: [_StatusChip(conn.link)],
+      ),
+      body: !conn.isConnected
+          ? const _NotConnected()
+          : tele.when(
+              data: (t) {
+                final rows = _sensorRows(t);
+                return ListView.separated(
+                  itemCount: rows.length,
+                  separatorBuilder: (_, __) =>
+                      const Divider(height: 1, color: Colors.white10),
+                  itemBuilder: (_, i) {
+                    final (label, value, unit) = rows[i];
+                    return ListTile(
+                      dense: true,
+                      title: Text(label,
+                          style: const TextStyle(color: Colors.white70)),
+                      trailing: Text("$value $unit",
+                          style: const TextStyle(
+                              color: Colors.cyanAccent,
+                              fontSize: 16,
+                              fontWeight: FontWeight.w600)),
+                    );
+                  },
+                );
+              },
+              loading: () => const Center(child: CircularProgressIndicator()),
+              error: (e, _) => Center(
+                  child: Text("Нет данных: $e",
+                      style: const TextStyle(color: Colors.redAccent))),
+            ),
+    );
+  }
+}
+
+
+// ===== экран «Ошибки (DTC)» =====
+
+class DtcScreen extends ConsumerWidget {
+  const DtcScreen({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final conn = ref.watch(connectionProvider);
+    return Scaffold(
+      backgroundColor: const Color(0xFF0E1116),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF161B22),
+        title: const Text("Ошибки (DTC)"),
+        actions: [_StatusChip(conn.link)],
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: conn.isConnected ? const _DtcPanel() : const _NotConnected(),
+      ),
+    );
+  }
+}
+
+
+// ===== экран «Стоп-кадр» =====
+
+class FreezeFrameScreen extends ConsumerStatefulWidget {
+  const FreezeFrameScreen({super.key});
+  @override
+  ConsumerState<FreezeFrameScreen> createState() => _FreezeFrameScreenState();
+}
+
+class _FreezeFrameScreenState extends ConsumerState<FreezeFrameScreen> {
+  List<FreezeEntry>? _entries;
+  bool _loading = false;
+  String? _error;
+
+  Future<void> _read() async {
+    final svc = ref.read(connectionProvider.notifier).service;
+    if (svc == null) return;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final e = await svc.readFreezeFrame();
+      setState(() => _entries = e);
+    } catch (e) {
+      setState(() => _error = "$e");
+    } finally {
+      setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final conn = ref.watch(connectionProvider);
+    return Scaffold(
+      backgroundColor: const Color(0xFF0E1116),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF161B22),
+        title: const Text("Стоп-кадр"),
+        actions: [_StatusChip(conn.link)],
+      ),
+      body: !conn.isConnected
+          ? const _NotConnected()
+          : Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text(
+                      "Параметры, зафиксированные ЭБУ в момент возникновения ошибки.",
+                      style: TextStyle(color: Colors.white54, fontSize: 13)),
+                  const SizedBox(height: 12),
+                  FilledButton.icon(
+                    icon: const Icon(Icons.download),
+                    label: const Text("Прочитать стоп-кадр"),
+                    onPressed: _loading ? null : _read,
+                  ),
+                  if (_loading) ...[
+                    const SizedBox(height: 12),
+                    const LinearProgressIndicator(),
+                  ],
+                  if (_error != null) ...[
+                    const SizedBox(height: 12),
+                    Text(_error!, style: const TextStyle(color: Colors.redAccent)),
+                  ],
+                  const SizedBox(height: 12),
+                  Expanded(
+                    child: _entries == null
+                        ? const Center(
+                            child: Text("Нажмите «Прочитать стоп-кадр»",
+                                style: TextStyle(color: Colors.white38)))
+                        : _entries!.isEmpty
+                            ? const Center(
+                                child: Text("Стоп-кадр пуст",
+                                    style: TextStyle(color: Colors.white38)))
+                            : ListView(
+                                children: _entries!
+                                    .map((e) => ListTile(
+                                          dense: true,
+                                          title: Text(e.label,
+                                              style: const TextStyle(
+                                                  color: Colors.white70)),
+                                          trailing: Text(
+                                              "${e.value.toStringAsFixed(1)} ${e.unit}",
+                                              style: const TextStyle(
+                                                  color: Colors.cyanAccent,
+                                                  fontSize: 16)),
+                                        ))
+                                    .toList(),
+                              ),
+                  ),
+                ],
+              ),
+            ),
+    );
+  }
+}
+
+
+// ===== экран «Идентификаторы ЭБУ» =====
+
+class EcuIdScreen extends ConsumerStatefulWidget {
+  const EcuIdScreen({super.key});
+  @override
+  ConsumerState<EcuIdScreen> createState() => _EcuIdScreenState();
+}
+
+class _EcuIdScreenState extends ConsumerState<EcuIdScreen> {
+  String? _vin;
+  String? _ecu;
+  bool _loading = false;
+  String? _error;
+
+  Future<void> _read() async {
+    final svc = ref.read(connectionProvider.notifier).service;
+    if (svc == null) return;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final vin = await svc.readVin();
+      final ecu = await svc.readEcuName();
+      setState(() {
+        _vin = vin;
+        _ecu = ecu;
+      });
+    } catch (e) {
+      setState(() => _error = "$e");
+    } finally {
+      setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final conn = ref.watch(connectionProvider);
+    return Scaffold(
+      backgroundColor: const Color(0xFF0E1116),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF161B22),
+        title: const Text("Идентификаторы ЭБУ"),
+        actions: [_StatusChip(conn.link)],
+      ),
+      body: !conn.isConnected
+          ? const _NotConnected()
+          : Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  FilledButton.icon(
+                    icon: const Icon(Icons.download),
+                    label: const Text("Считать идентификаторы"),
+                    onPressed: _loading ? null : _read,
+                  ),
+                  if (_loading) ...[
+                    const SizedBox(height: 12),
+                    const LinearProgressIndicator(),
+                  ],
+                  if (_error != null) ...[
+                    const SizedBox(height: 12),
+                    Text(_error!, style: const TextStyle(color: Colors.redAccent)),
+                  ],
+                  const SizedBox(height: 16),
+                  _idCard("VIN", _vin),
+                  const SizedBox(height: 12),
+                  _idCard("Имя/калибровка ЭБУ", _ecu),
+                ],
+              ),
+            ),
+    );
+  }
+
+  Widget _idCard(String label, String? value) {
+    return Card(
+      color: const Color(0xFF161B22),
+      child: ListTile(
+        title: Text(label, style: const TextStyle(color: Colors.white54, fontSize: 13)),
+        subtitle: SelectableText(
+          value ?? "—",
+          style: const TextStyle(
+              color: Colors.cyanAccent, fontSize: 18, fontWeight: FontWeight.w600),
+        ),
+      ),
+    );
+  }
+}
+
+
+// ===== экран «Тесты на выбросы» (готовность мониторов) =====
+
+class EmissionsScreen extends ConsumerStatefulWidget {
+  const EmissionsScreen({super.key});
+  @override
+  ConsumerState<EmissionsScreen> createState() => _EmissionsScreenState();
+}
+
+class _EmissionsScreenState extends ConsumerState<EmissionsScreen> {
+  Readiness? _data;
+  bool _loading = false;
+  String? _error;
+
+  Future<void> _read() async {
+    final svc = ref.read(connectionProvider.notifier).service;
+    if (svc == null) return;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final r = await svc.readReadiness();
+      setState(() => _data = r);
+    } catch (e) {
+      setState(() => _error = "$e");
+    } finally {
+      setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final conn = ref.watch(connectionProvider);
+    final d = _data;
+    return Scaffold(
+      backgroundColor: const Color(0xFF0E1116),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF161B22),
+        title: const Text("Тесты на выбросы"),
+        actions: [_StatusChip(conn.link)],
+      ),
+      body: !conn.isConnected
+          ? const _NotConnected()
+          : Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  FilledButton.icon(
+                    icon: const Icon(Icons.download),
+                    label: const Text("Проверить готовность"),
+                    onPressed: _loading ? null : _read,
+                  ),
+                  if (_loading) ...[
+                    const SizedBox(height: 12),
+                    const LinearProgressIndicator(),
+                  ],
+                  if (_error != null) ...[
+                    const SizedBox(height: 12),
+                    Text(_error!, style: const TextStyle(color: Colors.redAccent)),
+                  ],
+                  if (d != null) ...[
+                    const SizedBox(height: 16),
+                    Row(
+                      children: [
+                        Icon(d.milOn ? Icons.warning : Icons.check_circle,
+                            color: d.milOn ? Colors.orangeAccent : Colors.greenAccent),
+                        const SizedBox(width: 8),
+                        Text(
+                          d.milOn
+                              ? "Check Engine горит • ошибок: ${d.dtcCount}"
+                              : "Check Engine не горит • ошибок: ${d.dtcCount}",
+                          style: const TextStyle(color: Colors.white),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Expanded(
+                      child: ListView(
+                        children: d.monitors
+                            .where((m) => m.supported)
+                            .map((m) => ListTile(
+                                  dense: true,
+                                  leading: Icon(
+                                    m.complete ? Icons.check_circle : Icons.hourglass_bottom,
+                                    color: m.complete ? Colors.greenAccent : Colors.amber,
+                                  ),
+                                  title: Text(m.name,
+                                      style: const TextStyle(color: Colors.white70)),
+                                  trailing: Text(
+                                    m.complete ? "Готов" : "Не готов",
+                                    style: TextStyle(
+                                        color: m.complete
+                                            ? Colors.greenAccent
+                                            : Colors.amber),
+                                  ),
+                                ))
+                            .toList(),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+    );
+  }
+}
+
+
+// ===== экран «Статистика» =====
+
+class StatisticsScreen extends ConsumerWidget {
+  const StatisticsScreen({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final conn = ref.watch(connectionProvider);
+    // подписываемся на телеметрию, чтобы экран перерисовывался по мере опроса
+    ref.watch(telemetryProvider);
+    final svc = ref.read(connectionProvider.notifier).service;
+    final stats = svc?.statistics ?? const <String, MinMax>{};
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF0E1116),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF161B22),
+        title: const Text("Статистика"),
+        actions: [
+          if (svc != null)
+            IconButton(
+              icon: const Icon(Icons.refresh),
+              tooltip: "Сбросить",
+              onPressed: () => svc.resetStatistics(),
+            ),
+          _StatusChip(conn.link),
+        ],
+      ),
+      body: !conn.isConnected
+          ? const _NotConnected()
+          : stats.isEmpty
+              ? const Center(
+                  child: Text("Накапливаются данные…",
+                      style: TextStyle(color: Colors.white38)))
+              : ListView(
+                  children: [
+                    const Padding(
+                      padding: EdgeInsets.fromLTRB(16, 12, 16, 4),
+                      child: Row(
+                        children: [
+                          Expanded(flex: 3, child: Text("Параметр", style: TextStyle(color: Colors.white38))),
+                          Expanded(child: Text("Мин", style: TextStyle(color: Colors.white38))),
+                          Expanded(child: Text("Тек", style: TextStyle(color: Colors.white38))),
+                          Expanded(child: Text("Макс", style: TextStyle(color: Colors.white38))),
+                        ],
+                      ),
+                    ),
+                    ...stats.entries.map((e) {
+                      final s = e.value;
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        child: Row(
+                          children: [
+                            Expanded(
+                                flex: 3,
+                                child: Text(e.key,
+                                    style: const TextStyle(color: Colors.white70))),
+                            Expanded(
+                                child: Text(s.min.toStringAsFixed(0),
+                                    style: const TextStyle(color: Colors.lightBlueAccent))),
+                            Expanded(
+                                child: Text(s.last.toStringAsFixed(0),
+                                    style: const TextStyle(color: Colors.white))),
+                            Expanded(
+                                child: Text(s.max.toStringAsFixed(0),
+                                    style: const TextStyle(color: Colors.orangeAccent))),
+                          ],
+                        ),
+                      );
+                    }),
+                  ],
+                ),
+    );
+  }
+}
+
+
+// ===== экран «Запись данных» =====
+
+class DataLoggingScreen extends ConsumerStatefulWidget {
+  const DataLoggingScreen({super.key});
+  @override
+  ConsumerState<DataLoggingScreen> createState() => _DataLoggingScreenState();
+}
+
+class _DataLoggingScreenState extends ConsumerState<DataLoggingScreen> {
+  StreamSubscription<Telemetry>? _sub;
+  final List<Telemetry> _rows = [];
+  bool _recording = false;
+
+  void _toggle() {
+    final svc = ref.read(connectionProvider.notifier).service;
+    if (svc == null) return;
+    if (_recording) {
+      _sub?.cancel();
+      setState(() => _recording = false);
+    } else {
+      _sub = svc.telemetry.listen((t) {
+        if (mounted) setState(() => _rows.add(t));
+      });
+      setState(() => _recording = true);
+    }
+  }
+
+  void _clear() {
+    setState(() => _rows.clear());
+  }
+
+  String _csv() {
+    final b = StringBuffer();
+    b.writeln("rpm,speed,coolant,load,voltage,intake,fuel,maf,map,timing,ambient,fuelRate");
+    for (final t in _rows) {
+      b.writeln([
+        t.rpm, t.speed, t.coolant, t.load, t.voltage, t.intakeTemp,
+        t.fuelLevel, t.maf, t.map, t.timing, t.ambient, t.fuelRate
+      ].map((v) => v == null ? "" : v.toString()).join(","));
+    }
+    return b.toString();
+  }
+
+  void _showCsv() {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF161B22),
+        title: Text("CSV • строк: ${_rows.length}",
+            style: const TextStyle(color: Colors.white)),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: SingleChildScrollView(
+            child: SelectableText(_csv(),
+                style: const TextStyle(color: Colors.white70, fontFamily: "monospace", fontSize: 12)),
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context), child: const Text("Закрыть")),
+        ],
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final conn = ref.watch(connectionProvider);
+    return Scaffold(
+      backgroundColor: const Color(0xFF0E1116),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF161B22),
+        title: const Text("Запись данных"),
+        actions: [_StatusChip(conn.link)],
+      ),
+      body: !conn.isConnected
+          ? const _NotConnected()
+          : Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: FilledButton.icon(
+                          style: FilledButton.styleFrom(
+                            backgroundColor:
+                                _recording ? Colors.red.shade700 : Colors.green.shade600,
+                          ),
+                          icon: Icon(_recording ? Icons.stop : Icons.fiber_manual_record),
+                          label: Text(_recording ? "Стоп" : "Запись"),
+                          onPressed: _toggle,
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      OutlinedButton(
+                        onPressed: _rows.isEmpty ? null : _showCsv,
+                        child: const Text("Экспорт"),
+                      ),
+                      const SizedBox(width: 8),
+                      IconButton(
+                        icon: const Icon(Icons.delete_outline, color: Colors.white54),
+                        onPressed: _rows.isEmpty ? null : _clear,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Text("Записей: ${_rows.length}",
+                      style: const TextStyle(color: Colors.white54)),
+                  const SizedBox(height: 8),
+                  Expanded(
+                    child: _rows.isEmpty
+                        ? const Center(
+                            child: Text("Нет записей",
+                                style: TextStyle(color: Colors.white38)))
+                        : ListView.builder(
+                            reverse: true,
+                            itemCount: _rows.length,
+                            itemBuilder: (_, i) {
+                              final t = _rows[_rows.length - 1 - i];
+                              return ListTile(
+                                dense: true,
+                                title: Text(
+                                    "об ${t.rpm ?? '—'}  •  ${t.speed ?? '—'} км/ч  •  ОЖ ${t.coolant ?? '—'}°C",
+                                    style: const TextStyle(
+                                        color: Colors.white70, fontSize: 13)),
+                              );
+                            },
+                          ),
+                  ),
+                ],
+              ),
+            ),
+    );
+  }
+}
+
+
+// ===== экран «Замер разгона» =====
+
+class AccelerationScreen extends ConsumerStatefulWidget {
+  const AccelerationScreen({super.key});
+  @override
+  ConsumerState<AccelerationScreen> createState() => _AccelerationScreenState();
+}
+
+class _AccelerationScreenState extends ConsumerState<AccelerationScreen> {
+  StreamSubscription<Telemetry>? _sub;
+  final _watch = Stopwatch();
+  bool _armed = false;
+  int _speed = 0;
+  Duration? _t60;
+  Duration? _t100;
+
+  @override
+  void initState() {
+    super.initState();
+    final svc = ref.read(connectionProvider.notifier).service;
+    _sub = svc?.telemetry.listen(_onTele);
+  }
+
+  void _onTele(Telemetry t) {
+    final v = t.speed;
+    if (v == null) return;
+    setState(() => _speed = v);
+
+    // Старт замера: машина стояла и тронулась.
+    if (_armed && !_watch.isRunning && v > 0) {
+      _watch
+        ..reset()
+        ..start();
+      _t60 = null;
+      _t100 = null;
+    }
+    if (_watch.isRunning) {
+      if (_t60 == null && v >= 60) _t60 = _watch.elapsed;
+      if (_t100 == null && v >= 100) {
+        _t100 = _watch.elapsed;
+        _watch.stop();
+        _armed = false;
+      }
+    }
+  }
+
+  void _arm() {
+    setState(() {
+      _armed = true;
+      _t60 = null;
+      _t100 = null;
+      _watch.reset();
+    });
+  }
+
+  String _fmt(Duration? d) =>
+      d == null ? "—" : "${(d.inMilliseconds / 1000).toStringAsFixed(2)} с";
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final conn = ref.watch(connectionProvider);
+    return Scaffold(
+      backgroundColor: const Color(0xFF0E1116),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF161B22),
+        title: const Text("Замер разгона"),
+        actions: [_StatusChip(conn.link)],
+      ),
+      body: !conn.isConnected
+          ? const _NotConnected()
+          : Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text("$_speed",
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                          color: Colors.cyanAccent,
+                          fontSize: 72,
+                          fontWeight: FontWeight.bold)),
+                  const Text("км/ч",
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Colors.white54)),
+                  const SizedBox(height: 32),
+                  _resultRow("0–60 км/ч", _fmt(_t60)),
+                  const Divider(color: Colors.white10),
+                  _resultRow("0–100 км/ч", _fmt(_t100)),
+                  const SizedBox(height: 32),
+                  FilledButton.icon(
+                    icon: const Icon(Icons.flag),
+                    label: Text(_armed ? "Ожидание старта…" : "Подготовить замер"),
+                    onPressed: _armed ? null : _arm,
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                      "Остановитесь (0 км/ч), нажмите «Подготовить замер» и резко стартуйте.",
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Colors.white38, fontSize: 12)),
+                ],
+              ),
+            ),
+    );
+  }
+
+  Widget _resultRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: const TextStyle(color: Colors.white70, fontSize: 16)),
+          Text(value,
+              style: const TextStyle(
+                  color: Colors.greenAccent, fontSize: 20, fontWeight: FontWeight.bold)),
+        ],
+      ),
+    );
+  }
+}
+
+
+// ===== экран «Мои автомобили» =====
+
+class MyCarsScreen extends ConsumerWidget {
+  const MyCarsScreen({super.key});
+
+  Future<void> _add(BuildContext context, WidgetRef ref) async {
+    final nameCtrl = TextEditingController();
+    final vinCtrl = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF161B22),
+        title: const Text("Новый автомобиль", style: TextStyle(color: Colors.white)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: nameCtrl,
+              style: const TextStyle(color: Colors.white),
+              decoration: const InputDecoration(labelText: "Название"),
+            ),
+            TextField(
+              controller: vinCtrl,
+              style: const TextStyle(color: Colors.white),
+              decoration: const InputDecoration(labelText: "VIN (необязательно)"),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text("Отмена")),
+          FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text("Добавить")),
+        ],
+      ),
+    );
+    if (ok == true && nameCtrl.text.trim().isNotEmpty) {
+      ref.read(vehiclesProvider.notifier).add(
+            Vehicle(nameCtrl.text.trim(), vinCtrl.text.trim()),
+          );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final cars = ref.watch(vehiclesProvider);
+    return Scaffold(
+      backgroundColor: const Color(0xFF0E1116),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF161B22),
+        title: const Text("Мои автомобили"),
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: () => _add(context, ref),
+        child: const Icon(Icons.add),
+      ),
+      body: ListView.builder(
+        itemCount: cars.length,
+        itemBuilder: (_, i) {
+          final c = cars[i];
+          return Card(
+            color: const Color(0xFF161B22),
+            margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            child: ListTile(
+              leading: const Icon(Icons.directions_car, color: Colors.cyanAccent),
+              title: Text(c.name, style: const TextStyle(color: Colors.white)),
+              subtitle: Text(c.vin.isEmpty ? "VIN не указан" : c.vin,
+                  style: const TextStyle(color: Colors.white54)),
+              trailing: IconButton(
+                icon: const Icon(Icons.delete_outline, color: Colors.white38),
+                onPressed: () => ref.read(vehiclesProvider.notifier).removeAt(i),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+
+// ===== экран «Настройки» =====
+
+class SettingsScreen extends ConsumerWidget {
+  const SettingsScreen({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final kind = ref.watch(transportKindProvider);
+    final host = ref.watch(wifiHostProvider);
+    final port = ref.watch(wifiPortProvider);
+    final interval = ref.watch(pollIntervalMsProvider);
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF0E1116),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF161B22),
+        title: const Text("Настройки"),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          const Text("Тип адаптера",
+              style: TextStyle(color: Colors.white54, fontSize: 13)),
+          const SizedBox(height: 8),
+          SegmentedButton<TransportKind>(
+            segments: const [
+              ButtonSegment(value: TransportKind.ble, label: Text("BLE")),
+              ButtonSegment(value: TransportKind.btClassic, label: Text("BT")),
+              ButtonSegment(value: TransportKind.wifi, label: Text("Wi-Fi")),
+            ],
+            selected: {kind},
+            onSelectionChanged: (s) =>
+                ref.read(transportKindProvider.notifier).state = s.first,
+          ),
+          const SizedBox(height: 24),
+          if (kind == TransportKind.wifi) ...[
+            const Text("Адрес Wi-Fi адаптера",
+                style: TextStyle(color: Colors.white54, fontSize: 13)),
+            const SizedBox(height: 8),
+            TextFormField(
+              initialValue: host,
+              style: const TextStyle(color: Colors.white),
+              decoration: const InputDecoration(labelText: "Хост (IP)"),
+              onChanged: (v) => ref.read(wifiHostProvider.notifier).state = v.trim(),
+            ),
+            TextFormField(
+              initialValue: port.toString(),
+              style: const TextStyle(color: Colors.white),
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: "Порт"),
+              onChanged: (v) {
+                final p = int.tryParse(v.trim());
+                if (p != null) ref.read(wifiPortProvider.notifier).state = p;
+              },
+            ),
+            const SizedBox(height: 24),
+          ],
+          Text("Частота опроса: $interval мс",
+              style: const TextStyle(color: Colors.white54, fontSize: 13)),
+          Slider(
+            value: interval.toDouble().clamp(50, 1000).toDouble(),
+            min: 50,
+            max: 1000,
+            divisions: 19,
+            label: "$interval мс",
+            onChanged: (v) =>
+                ref.read(pollIntervalMsProvider.notifier).state = v.round(),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+              "Меньше значение — чаще обновление, но выше нагрузка на адаптер. "
+              "Изменения применяются при следующем подключении.",
+              style: TextStyle(color: Colors.white38, fontSize: 12)),
+        ],
+      ),
+    );
+  }
+}
+
+
 // ===== из main.dart =====
 
 void main() {
@@ -1386,14 +2897,14 @@ class ObdApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: "OBD Scanner",
+      title: "Car Scanner",
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
         brightness: Brightness.dark,
-        colorSchemeSeed: Colors.cyan,
+        colorSchemeSeed: Colors.blue,
       ),
-      home: const DashboardScreen(),
+      home: const HomeMenuScreen(),
     );
   }
 }
